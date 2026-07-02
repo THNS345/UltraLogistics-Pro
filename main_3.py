@@ -3528,10 +3528,62 @@ st.set_page_config(
 
 init_session_state()
 
+
+# ==========================================================
+# LOGIN / AUTHENTICATION
+# ==========================================================
+
+def check_password() -> bool:
+    """
+    Simple username/password gate using Streamlit secrets.
+
+    Expected secrets format:
+
+    [passwords]
+    admin = "your_password"
+    estimating = "another_password"
+    """
+    if st.session_state.get("authenticated", False):
+        return True
+
+    st.title("🔐 UltraLogistics Pro Login")
+
+    try:
+        valid_passwords = dict(st.secrets.get("passwords", {}))
+    except Exception:
+        valid_passwords = {}
+
+    if not valid_passwords:
+        st.error(
+            "No passwords are configured. Add a [passwords] section in Streamlit secrets."
+        )
+        st.stop()
+
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+
+    if submitted:
+        username = clean_str(username)
+
+        if username in valid_passwords and hmac.compare_digest(
+            password,
+            str(valid_passwords[username]),
+        ):
+            st.session_state.authenticated = True
+            st.session_state.username = username
+            st.rerun()
+
+        else:
+            st.error("Invalid username or password.")
+
+    st.stop()
+
+
+check_password()
+
 st.title("🚚 UltraLogistics Pro")
-st.caption(
-    "Crating, palletizing, vehicle loading, scenario comparison, and manifest export."
-)
 
 # ==========================================================
 # 21. SIDEBAR: CONFIG, PROJECT, ASSUMPTIONS
@@ -3539,6 +3591,15 @@ st.caption(
 
 with st.sidebar:
     st.title("⚙️ Setup")
+
+    st.caption(f"Logged in as: {st.session_state.get('username', '')}")
+
+    if st.button("Logout", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.username = ""
+        st.rerun()
+
+    st.markdown("---")
 
     # ------------------------------------------------------
     # Custom vehicle / pallet config
