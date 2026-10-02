@@ -1,42 +1,52 @@
 from __future__ import annotations
 
+import hmac
 import json
 import math
 import re
-import hmac
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from io import BytesIO
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib import patches
-
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import landscape, letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import (
-    SimpleDocTemplate,
+    Image as RLImage,
+    PageBreak,
     Paragraph,
+    SimpleDocTemplate,
     Spacer,
     Table,
     TableStyle,
-    Image as RLImage,
-    PageBreak,
 )
-from reportlab.lib.pagesizes import letter, landscape
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib import colors
 
 
 # ==========================================================
 # ULTRALOGISTICS PRO
-# Upgraded single-file Streamlit logistics/crating planner
-# Paste all parts into one .py file in order.
+# Single-file Streamlit logistics / crating planner.
+#
+# Revision 2026-10-02:
+#   - Factory transport rules built in (standard pallet / low-floor
+#     pallet without glass / slant rack / split or disassemble).
+#   - Vehicle DOOR height is now the loading constraint.
+#   - Slant racks lean the unit backwards: the lean uses rack DEPTH.
+#   - Pallet load height, crate volume and vehicle floor fit are checked.
+#   - Forced disassembly creates frame kits (25 %), manual split 15 %.
+#   - First-fit crating, payload-aware container loading, bug fixes.
+#
+# Run with:  streamlit run ultralogistics_pro.py
 # ==========================================================
+
+APP_NAME = "UltraLogistics Pro"
+APP_VERSION = "2026-10-02"
 
 
 # ==========================================================
@@ -45,19 +55,75 @@ from reportlab.lib import colors
 
 MM_TO_INCH = 1 / 25.4
 
-# 2718 mm = about 107.01"
-DEFAULT_FACTORY_SLANT_MAX_H_IN = 2718.0 * MM_TO_INCH
 
-CRATE_SIDE_CLEAR = 2.0
-CRATE_BASE_DEPTH = 4.0
-UNIT_SPACER = 1.0
-PALLET_H = 6.0
+def mm_to_in(value_mm: float) -> float:
+    return float(value_mm) * MM_TO_INCH
+
+
+def in_to_mm(value_in: float) -> float:
+    return float(value_in) * 25.4
+
+
+# ----------------------------------------------------------
+# Factory transport rules (vertical height of the unit AS SHIPPED)
+#   <= 2350 mm         : standard certified pallet / crate, glass in unit
+#   2351 - 2438 mm     : low-floor pallet, WITHOUT glass; suitable for
+#                        transport but NOT for transshipment / handling
+#   > 2438 mm          : slanted rack (max unit height 2718 mm) or ship in parts
+#   > 2718 mm          : turn on side (if width allows), split or disassemble
+# ----------------------------------------------------------
+FACTORY_STD_PALLET_MAX_MM = 2350.0
+FACTORY_LOW_FLOOR_MAX_MM = 2438.0
+FACTORY_SLANT_MAX_MM = 2718.0
+
+# Kept for backwards compatibility with older code/configs.
+DEFAULT_FACTORY_SLANT_MAX_H_IN = mm_to_in(FACTORY_SLANT_MAX_MM)
+
+CRATE_SIDE_CLEAR = 2.0       # clearance at each end of crate length
+CRATE_BASE_DEPTH = 4.0       # fixed depth allowance (front + back boards)
+UNIT_SPACER = 1.0            # spacer between stacked units
+PALLET_H = 6.0               # pallet deck height
+FRAME_KIT_PROFILE_H = 6.0    # assumed profile height of a frame-kit stick
+
+# Packaging height overheads (base + top) added to the unit's vertical height.
+# Chosen so a 40' HC (door 2585 mm, 2" clearance) reproduces the factory bands.
+DEFAULT_STD_PACK_OVERHEAD = 6.0
+DEFAULT_LOW_FLOOR_PACK_OVERHEAD = 3.5
 
 DEFAULT_CRATE_MAX_LEN_EXT = 630.0
 DEFAULT_CRATE_MAX_WIDTH_EXT = 48.0
+DEFAULT_SLANT_RACK_MAX_DEPTH_EXT = 88.0
+DEFAULT_CRATE_MAX_VOLUME_EXT = 1_000_000.0
 
 DEFAULT_CONTAINER_ITEM_CLEARANCE = 1.0
 DEFAULT_HEIGHT_CLEARANCE = 2.0
+
+# Transport classes
+CLASS_STD = "STANDARD"
+CLASS_LOW = "LOW-FLOOR"
+CLASS_SLANT = "SLANT RACK"
+CLASS_DIS = "DISASSEMBLED"
+CLASS_OVERSIZE = "OVERSIZE"
+
+PACKAGE_TYPE_BY_CLASS = {
+    CLASS_STD: "CRATE",
+    CLASS_DIS: "CRATE",
+    CLASS_LOW: "LOW-FLOOR PALLET",
+    CLASS_SLANT: "SLANT RACK",
+    CLASS_OVERSIZE: "CRATE",
+}
+
+HANDLING_NOTE_BY_CLASS = {
+    CLASS_LOW: (
+        "Low-floor pallet: unit ships WITHOUT glass (glazing shipped separately). "
+        "Transport only, not suitable for transshipment/handling."
+    ),
+    CLASS_SLANT: "Slant rack: confirm with factory whether glass ships in the unit.",
+    CLASS_OVERSIZE: "Exceeds all factory transport options: split or disassemble.",
+}
+
+VALID_MODES = {"WHOLE", "SLANT", "DISASSEMBLED"}
+VALID_ORIENTS = {"AUTO", "UPRIGHT", "SIDE"}
 
 MASTER_COLUMNS = [
     "Order",
@@ -96,29 +162,35 @@ ORDER_COLOR_HEX = [
     "#ffa600",
 ]
 
+# H = interior height, door_H = door opening height (loading constraint).
+# Verify door heights with the carrier; they vary by box and trailer.
 DEFAULT_CONTAINERS: Dict[str, Dict[str, float]] = {
     "40' HC Container": {
         "L": 473.0,
         "W": 92.0,
         "H": 105.0,
+        "door_H": round(mm_to_in(2585), 1),
         "max_lbs": 44000.0,
     },
     "40' Standard": {
         "L": 473.0,
         "W": 92.0,
-        "H": 95.0,
+        "H": 94.0,
+        "door_H": round(mm_to_in(2280), 1),
         "max_lbs": 44000.0,
     },
     "53' Dry Van": {
         "L": 636.0,
         "W": 100.0,
         "H": 110.0,
+        "door_H": 108.0,
         "max_lbs": 45000.0,
     },
     "20' Standard": {
         "L": 232.0,
         "W": 92.0,
-        "H": 95.0,
+        "H": 94.0,
+        "door_H": round(mm_to_in(2280), 1),
         "max_lbs": 28000.0,
     },
 }
@@ -127,22 +199,40 @@ DEFAULT_PALLETS: Dict[str, Dict[str, float]] = {
     "US GMA (48x40)": {
         "L": 48.0,
         "W": 40.0,
-        "H": 6.0,
+        "H": PALLET_H,
         "max_lbs": 2200.0,
     },
     "Euro 2 (1200x1000mm)": {
-        "L": 1200 * MM_TO_INCH,
-        "W": 1000 * MM_TO_INCH,
-        "H": 6.0,
+        "L": round(mm_to_in(1200), 2),
+        "W": round(mm_to_in(1000), 2),
+        "H": PALLET_H,
+        "max_lbs": 2200.0,
+    },
+    "Factory (2200x1000mm)": {
+        "L": round(mm_to_in(2200), 2),
+        "W": round(mm_to_in(1000), 2),
+        "H": PALLET_H,
         "max_lbs": 2200.0,
     },
     "Oversize (96x48)": {
         "L": 96.0,
         "W": 48.0,
-        "H": 6.0,
+        "H": PALLET_H,
         "max_lbs": 3000.0,
     },
 }
+
+SCENARIO_CURRENT = "Current Settings"
+SCENARIO_SLANT = "Slant Instead of Low-Floor / Oversize"
+SCENARIO_DISASSEMBLE = "Disassemble Oversized Units"
+SCENARIO_SPLIT = "Split Oversized Units"
+
+SCENARIO_OPTIONS = [
+    SCENARIO_CURRENT,
+    SCENARIO_SLANT,
+    SCENARIO_DISASSEMBLE,
+    SCENARIO_SPLIT,
+]
 
 
 # ==========================================================
@@ -157,40 +247,61 @@ def today_file_stamp() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def clean_str(value: Any) -> str:
+def is_blank(value: Any) -> bool:
+    """True for None, NaN/NaT/pd.NA and empty strings."""
     if value is None:
+        return True
+
+    if isinstance(value, str):
+        return value.strip() == ""
+
+    if not pd.api.types.is_scalar(value):
+        return False
+
+    try:
+        return bool(pd.isna(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def clean_str(value: Any) -> str:
+    if is_blank(value):
         return ""
     return str(value).strip()
 
 
+_UNIT_SUFFIX_RE = re.compile(r'(?i)\s*(inches|inch|in|")\s*$')
+
+
 def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
-    if value is None:
+    if is_blank(value):
         return default
 
-    text = str(value).strip()
-    text = text.replace(",", "")
-    text = text.replace('"', "")
-    text = text.replace("in", "")
-    text = text.strip()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        number = float(value)
+    else:
+        text = str(value).strip().replace(",", "")
+        text = _UNIT_SUFFIX_RE.sub("", text).strip()
 
-    if text == "":
+        if text == "":
+            return default
+
+        try:
+            number = float(text)
+        except (TypeError, ValueError):
+            return default
+
+    if math.isnan(number) or math.isinf(number):
         return default
 
-    try:
-        return float(text)
-    except Exception:
-        return default
+    return number
 
 
 def safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
-    f = safe_float(value, None)
-    if f is None:
+    number = safe_float(value, None)
+    if number is None:
         return default
-
-    try:
-        return int(round(f))
-    except Exception:
-        return default
+    return int(round(number))
 
 
 def slugify(value: str, fallback: str = "load-plan") -> str:
@@ -203,6 +314,10 @@ def slugify(value: str, fallback: str = "load-plan") -> str:
 
 def inches_text(value: float) -> str:
     return f'{value:.1f}"'
+
+
+def inches_mm_text(value: float) -> str:
+    return f'{value:.1f}" ({in_to_mm(value):,.0f} mm)'
 
 
 def pounds_text(value: float) -> str:
@@ -224,58 +339,16 @@ def hex_to_rgba(hex_color: str, alpha: float) -> str:
 
 
 def build_order_color_map(order_names: List[str]) -> Dict[str, str]:
-    unique_names = sorted(set([x for x in order_names if clean_str(x)]))
-    color_map: Dict[str, str] = {}
-
-    for i, order_name in enumerate(unique_names):
-        color_map[order_name] = ORDER_COLOR_HEX[i % len(ORDER_COLOR_HEX)]
-
-    return color_map
-
-
-def order_of_piece_id(piece_id: str) -> str:
-    if "|" not in piece_id:
-        return ""
-    return piece_id.split("|", 1)[0]
-
-
-def base_mark_of_piece_id(piece_id: str) -> str:
-    if "|" in piece_id:
-        piece_id = piece_id.split("|", 1)[1]
-    return piece_id.split("#", 1)[0]
-
-
-def get_vehicle_internal_crate_height_limit(
-    vehicle_data: Dict[str, float],
-    height_clearance: float,
-) -> float:
-    """
-    Max INTERNAL usable crate height.
-
-    Ensures:
-    crate internal height + top/bottom crate clearances + vehicle clearance
-    stays inside selected vehicle height.
-    """
-    vehicle_h = float(vehicle_data["H"])
-    return max(
-        1.0,
-        vehicle_h - height_clearance - (2 * CRATE_SIDE_CLEAR),
-    )
-
-
-def get_vehicle_external_crate_height_limit(
-    vehicle_data: Dict[str, float],
-    height_clearance: float,
-) -> float:
-    """
-    Max EXTERNAL crate height allowed inside selected vehicle.
-    """
-    vehicle_h = float(vehicle_data["H"])
-    return max(1.0, vehicle_h - height_clearance)
+    unique_names = sorted(set(x for x in order_names if clean_str(x)))
+    return {
+        name: ORDER_COLOR_HEX[i % len(ORDER_COLOR_HEX)]
+        for i, name in enumerate(unique_names)
+    }
 
 
 def json_download_bytes(data: Dict[str, Any]) -> bytes:
     return json.dumps(data, indent=2, default=str).encode("utf-8")
+
 
 # ==========================================================
 # 3. DATA MODELS
@@ -304,16 +377,30 @@ class LogisticsAssumptions:
     glass_kg_m2: float = 30.0
     std_weight_multiplier: float = 1.35
     lsd_weight_multiplier: float = 1.40
-    frame_kit_weight_pct: float = 0.20
+
+    # Share of unit weight that goes into the frame kit.
+    frame_kit_pct_disassembly: float = 0.25   # DISASSEMBLED, no split
+    frame_kit_pct_split: float = 0.15         # DISASSEMBLED with a row/column split
 
     max_crate_lbs: float = 2500.0
     max_pallet_lbs: float = 2200.0
 
     crate_max_len_ext: float = DEFAULT_CRATE_MAX_LEN_EXT
     crate_max_width_ext: float = DEFAULT_CRATE_MAX_WIDTH_EXT
+    slant_rack_max_depth_ext: float = DEFAULT_SLANT_RACK_MAX_DEPTH_EXT
+    crate_max_volume_ext: float = DEFAULT_CRATE_MAX_VOLUME_EXT
 
     vehicle_height_clearance: float = DEFAULT_HEIGHT_CLEARANCE
     container_item_clearance: float = DEFAULT_CONTAINER_ITEM_CLEARANCE
+
+    # Factory transport rules (mm, vertical height as shipped)
+    factory_std_max_mm: float = FACTORY_STD_PALLET_MAX_MM
+    factory_low_floor_max_mm: float = FACTORY_LOW_FLOOR_MAX_MM
+    factory_slant_max_mm: float = FACTORY_SLANT_MAX_MM
+    allow_low_floor: bool = True
+
+    std_pack_overhead: float = DEFAULT_STD_PACK_OVERHEAD
+    low_floor_pack_overhead: float = DEFAULT_LOW_FLOOR_PACK_OVERHEAD
 
     no_mixing_orders: bool = True
     allow_pallets_for_disassembled: bool = True
@@ -321,6 +408,92 @@ class LogisticsAssumptions:
     planning_warning: str = (
         "Planning layout only. Final loading, blocking, bracing, route limits, "
         "and carrier requirements must be verified by logistics/freight team."
+    )
+
+
+@dataclass
+class TransportLimits:
+    """
+    All height/size limits for one vehicle + assumption set.
+
+    vehicle_limit_h : min(interior height, door height)
+    usable_ext_h    : max external package height (vehicle_limit_h - clearance)
+    std_max_v       : max unit vertical on a standard pallet/crate
+    low_floor_max_v : max unit vertical on a low-floor pallet (no glass)
+    slant_max_v     : max unit vertical that may go on a slant rack
+    slant_target_v  : rack height a slanted unit is leaned down to
+    """
+    vehicle_L: float
+    vehicle_W: float
+    vehicle_limit_h: float
+    usable_ext_h: float
+    std_max_v: float
+    low_floor_max_v: float
+    slant_max_v: float
+    slant_target_v: float
+    std_overhead: float
+    low_overhead: float
+    floor_clearance: float
+
+    def max_for_class(self, transport_class: str) -> float:
+        if transport_class == CLASS_STD:
+            return self.std_max_v
+        if transport_class == CLASS_LOW:
+            return self.low_floor_max_v
+        if transport_class == CLASS_SLANT:
+            return self.slant_max_v
+        if transport_class == CLASS_DIS:
+            return self.std_max_v
+        return 0.0
+
+    def fits_floor(self, length: float, width: float) -> bool:
+        c = self.floor_clearance
+        return (
+            (length + c <= self.vehicle_L and width + c <= self.vehicle_W)
+            or (width + c <= self.vehicle_L and length + c <= self.vehicle_W)
+        )
+
+
+def vehicle_limit_height(vehicle_data: Dict[str, float]) -> float:
+    interior = float(vehicle_data["H"])
+    door = safe_float(vehicle_data.get("door_H"), None)
+    if door is None or door <= 0:
+        return interior
+    return min(interior, door)
+
+
+def get_transport_limits(
+    vehicle_data: Dict[str, float],
+    a: LogisticsAssumptions,
+) -> TransportLimits:
+    limit_h = vehicle_limit_height(vehicle_data)
+    usable = max(1.0, limit_h - a.vehicle_height_clearance)
+
+    std_cap = max(1.0, usable - a.std_pack_overhead)
+    low_cap = max(1.0, usable - a.low_floor_pack_overhead)
+
+    std_max = min(mm_to_in(a.factory_std_max_mm), std_cap)
+
+    if a.allow_low_floor:
+        low_max = max(std_max, min(mm_to_in(a.factory_low_floor_max_mm), low_cap))
+    else:
+        low_max = std_max
+
+    slant_target = std_cap
+    slant_max = max(mm_to_in(a.factory_slant_max_mm), 0.0)
+
+    return TransportLimits(
+        vehicle_L=float(vehicle_data["L"]),
+        vehicle_W=float(vehicle_data["W"]),
+        vehicle_limit_h=limit_h,
+        usable_ext_h=usable,
+        std_max_v=std_max,
+        low_floor_max_v=low_max,
+        slant_max_v=slant_max,
+        slant_target_v=slant_target,
+        std_overhead=a.std_pack_overhead,
+        low_overhead=a.low_floor_pack_overhead,
+        floor_clearance=a.container_item_clearance,
     )
 
 
@@ -352,175 +525,198 @@ class Piece:
     orientation: str = "AUTO"
     source_order: str = ""
 
-    def resolved_orientation(self, max_h_int: float) -> str:
+    # ------------------------------------------------------
+    # Transport plan
+    # ------------------------------------------------------
+    def plan(self, lim: TransportLimits) -> Tuple[str, str]:
         """
-        Resolves AUTO orientation.
+        Returns (orientation, transport_class).
 
-        UPRIGHT means vertical dimension = height.
-        SIDE means vertical dimension = width.
+        orientation:
+            UPRIGHT  vertical = height
+            SIDE     vertical = width
+            ON EDGE  disassembled part standing on its shorter edge
         """
         if self.mode == "DISASSEMBLED":
-            return "UPRIGHT"
+            vertical = min(self.w, self.h)
+            cls = CLASS_DIS if vertical <= lim.std_max_v else CLASS_OVERSIZE
+            return "ON EDGE", cls
 
         if self.orientation in ("UPRIGHT", "SIDE"):
-            return self.orientation
+            allowed = [self.orientation]
+        else:
+            allowed = ["UPRIGHT", "SIDE"]
 
-        if self.h <= max_h_int:
-            return "UPRIGHT"
+        def vertical_of(orient: str) -> float:
+            return self.w if orient == "SIDE" else self.h
 
-        if self.w <= max_h_int:
-            return "SIDE"
+        if self.mode == "SLANT":
+            for orient in allowed:
+                if vertical_of(orient) <= lim.slant_max_v:
+                    return orient, CLASS_SLANT
+            return allowed[0], CLASS_OVERSIZE
 
-        return "UPRIGHT"
+        # WHOLE: automatic choice, in factory preference order.
+        preference = [
+            ("UPRIGHT", CLASS_STD),
+            ("SIDE", CLASS_STD),
+            ("UPRIGHT", CLASS_LOW),
+            ("UPRIGHT", CLASS_SLANT),
+            ("SIDE", CLASS_LOW),
+            ("SIDE", CLASS_SLANT),
+        ]
 
-    def oriented_vertical(self, max_h_int: float) -> float:
-        if self.resolved_orientation(max_h_int) == "SIDE":
+        for orient, cls in preference:
+            if orient not in allowed:
+                continue
+            if cls == CLASS_LOW and lim.low_floor_max_v <= lim.std_max_v:
+                continue
+            if vertical_of(orient) <= lim.max_for_class(cls):
+                return orient, cls
+
+        return allowed[0], CLASS_OVERSIZE
+
+    def transport_class(self, lim: TransportLimits) -> str:
+        return self.plan(lim)[1]
+
+    def resolved_orientation(self, lim: TransportLimits) -> str:
+        return self.plan(lim)[0]
+
+    def vertical(self, lim: TransportLimits) -> float:
+        """Unit dimension that stands vertical (before any slanting)."""
+        orient = self.resolved_orientation(lim)
+        if orient == "ON EDGE":
+            return min(self.w, self.h)
+        if orient == "SIDE":
             return self.w
         return self.h
 
-    def oriented_base(self, max_h_int: float) -> float:
-        if self.resolved_orientation(max_h_int) == "SIDE":
+    def base(self, lim: TransportLimits) -> float:
+        """Unit dimension that runs along the crate length."""
+        orient = self.resolved_orientation(lim)
+        if orient == "ON EDGE":
+            return max(self.w, self.h)
+        if orient == "SIDE":
             return self.h
         return self.w
 
-    def crate_len_need_int(self, max_h_int: float) -> float:
-        """
-        Required INTERNAL crate length.
-
-        For slanted items:
-        length = base + horizontal run created by leaning the piece.
-        """
-        if self.mode == "DISASSEMBLED":
-            return max(self.w, self.h)
-
-        vert = self.oriented_vertical(max_h_int)
-        base = self.oriented_base(max_h_int)
-
-        if self.mode == "SLANT" and vert > max_h_int:
-            slant_run = math.sqrt(max(0.0, vert ** 2 - max_h_int ** 2))
-            return base + slant_run
-
-        return base
-
-    def crate_eff_vertical_h(self, max_h_int: float) -> float:
-        """
-        Effective internal crate height consumed by this piece.
-        """
-        if self.mode == "DISASSEMBLED":
-            return min(self.w, self.h)
-
-        if self.mode == "SLANT":
-            return min(self.oriented_vertical(max_h_int), max_h_int)
-
-        return self.oriented_vertical(max_h_int)
-
-    def pallet_footprint_dims(
-        self,
-        pallet_L: float,
-        pallet_W: float,
-    ) -> Optional[Tuple[float, float]]:
-        """
-        Returns footprint dimensions on a pallet if this piece can fit.
-
-        This simple palletizer treats disassembled pieces as long flat parts.
-        """
-        if self.mode == "DISASSEMBLED":
-            base = max(self.w, self.h)
-        else:
-            base = self.oriented_base(DEFAULT_FACTORY_SLANT_MAX_H_IN)
-
-        thick = self.d + UNIT_SPACER
-
-        if base <= pallet_L and thick <= pallet_W:
-            return base, thick
-
-        if base <= pallet_W and thick <= pallet_L:
-            return thick, base
-
-        return None
+    def stack_thickness(self) -> float:
+        return self.d + UNIT_SPACER
 
 
 @dataclass
 class Crate:
+    """
+    A crate, low-floor pallet or slant rack holding units stacked side by side.
+
+    Length axis : unit base (width of the unit)
+    Depth axis  : stack of unit thicknesses (+ slant lean for racks)
+    Height      : unit vertical (+ packaging overhead)
+    """
     order: str = ""
+    pclass: str = CLASS_STD
     pieces: List[Piece] = field(default_factory=list)
-    depth_used: float = CRATE_BASE_DEPTH
     weight: float = 0.0
-    max_len_int: float = 0.0
-    max_h_int: float = 0.0
+    problem: str = ""
 
     @property
-    def L_ext(self) -> float:
-        return self.max_len_int + 2 * CRATE_SIDE_CLEAR
+    def package_type(self) -> str:
+        return PACKAGE_TYPE_BY_CLASS.get(self.pclass, "CRATE")
 
-    @property
-    def W_ext(self) -> float:
-        return self.depth_used
+    def slant_geometry(self, lim: TransportLimits, pieces: Optional[List[Piece]] = None) -> Tuple[float, float]:
+        """
+        Returns (cos_theta, max_horizontal_run) for a slant rack.
 
-    @property
-    def H_ext(self) -> float:
-        return self.max_h_int + 2 * CRATE_SIDE_CLEAR
+        All units on a rack share the lean angle set by the tallest unit,
+        which is leaned down to the rack height (slant_target_v).
+        """
+        pieces = self.pieces if pieces is None else pieces
+        if self.pclass != CLASS_SLANT or not pieces:
+            return 1.0, 0.0
 
-    def projected_add(
+        tallest = max(p.vertical(lim) for p in pieces)
+        target = lim.slant_target_v
+
+        if tallest <= target:
+            return 1.0, 0.0
+
+        cos_t = target / tallest
+        run = math.sqrt(max(0.0, tallest ** 2 - target ** 2))
+        return cos_t, run
+
+    def dims(self, lim: TransportLimits, pieces: Optional[List[Piece]] = None) -> Tuple[float, float, float]:
+        """External (L, W, H) for the given pieces (defaults to current contents)."""
+        pieces = self.pieces if pieces is None else pieces
+        if not pieces:
+            return 0.0, 0.0, 0.0
+
+        length = max(p.base(lim) for p in pieces) + 2 * CRATE_SIDE_CLEAR
+        stack = sum(p.stack_thickness() for p in pieces)
+
+        if self.pclass == CLASS_SLANT:
+            cos_t, run = self.slant_geometry(lim, pieces)
+            depth = CRATE_BASE_DEPTH + stack / cos_t + run
+            height_used = max(p.vertical(lim) for p in pieces) * cos_t
+            overhead = lim.std_overhead
+        else:
+            depth = CRATE_BASE_DEPTH + stack
+            height_used = max(p.vertical(lim) for p in pieces)
+            overhead = lim.low_overhead if self.pclass == CLASS_LOW else lim.std_overhead
+
+        return length, depth, height_used + overhead
+
+    def limit_violations(
         self,
-        p: Piece,
-        max_h_int: float,
-    ) -> Dict[str, float]:
-        l_need = p.crate_len_need_int(max_h_int)
-        h_need = p.crate_eff_vertical_h(max_h_int)
+        lim: TransportLimits,
+        a: LogisticsAssumptions,
+        pieces: Optional[List[Piece]] = None,
+        weight: Optional[float] = None,
+    ) -> List[str]:
+        pieces = self.pieces if pieces is None else pieces
+        weight = self.weight if weight is None else weight
+        length, depth, height = self.dims(lim, pieces)
 
-        return {
-            "weight": self.weight + p.lbs,
-            "L_ext": max(self.max_len_int, l_need) + 2 * CRATE_SIDE_CLEAR,
-            "W_ext": self.depth_used + p.d + UNIT_SPACER,
-            "H_ext": max(self.max_h_int, h_need) + 2 * CRATE_SIDE_CLEAR,
-        }
+        max_depth = (
+            a.slant_rack_max_depth_ext
+            if self.pclass == CLASS_SLANT
+            else a.crate_max_width_ext
+        )
 
-    def can_add(
-        self,
-        p: Piece,
-        max_h_int: float,
-        max_crate_lbs: float,
-        max_len_ext: float,
-        max_width_ext: float,
-        max_height_ext: float,
-    ) -> Tuple[bool, str]:
-        projected = self.projected_add(p, max_h_int)
+        issues: List[str] = []
 
-        if projected["weight"] > max_crate_lbs:
-            return False, "crate weight limit"
+        if weight > a.max_crate_lbs:
+            issues.append("OVER CRATE WEIGHT")
+        if length > a.crate_max_len_ext:
+            issues.append("OVER CRATE LENGTH")
+        if depth > max_depth:
+            issues.append("OVER RACK DEPTH" if self.pclass == CLASS_SLANT else "OVER CRATE WIDTH")
+        if height > lim.usable_ext_h + 1e-6:
+            issues.append("OVER VEHICLE/DOOR HEIGHT")
+        if length * depth * height > a.crate_max_volume_ext:
+            issues.append("OVER CRATE VOLUME")
+        if not lim.fits_floor(length, depth):
+            issues.append("DOES NOT FIT VEHICLE FLOOR")
 
-        if projected["L_ext"] > max_len_ext:
-            return False, "crate length limit"
+        return issues
 
-        if projected["W_ext"] > max_width_ext:
-            return False, "crate width/depth limit"
-
-        if projected["H_ext"] > max_height_ext:
-            return False, "vehicle height limit"
-
+    def can_add(self, p: Piece, lim: TransportLimits, a: LogisticsAssumptions) -> Tuple[bool, str]:
+        trial = self.pieces + [p]
+        issues = self.limit_violations(lim, a, trial, self.weight + p.lbs)
+        if issues:
+            return False, "; ".join(issues).lower()
         return True, "fits"
 
-    def add(
-        self,
-        p: Piece,
-        max_h_int: float,
-    ) -> None:
+    def add(self, p: Piece) -> None:
         self.pieces.append(p)
-        self.depth_used += p.d + UNIT_SPACER
-        self.max_len_int = max(
-            self.max_len_int,
-            p.crate_len_need_int(max_h_int),
-        )
-        self.max_h_int = max(
-            self.max_h_int,
-            p.crate_eff_vertical_h(max_h_int),
-        )
         self.weight += p.lbs
 
 
 @dataclass
 class PalletObject:
+    """
+    Pallet holding disassembled parts standing on edge in rows.
+    Footprint per part = long edge x (thickness + spacer).
+    """
     order: str
     name: str
     L: float
@@ -529,42 +725,57 @@ class PalletObject:
     max_wgt: float
     pieces: List[Piece] = field(default_factory=list)
     weight: float = 0.0
+    load_h: float = 0.0
     uL: float = 0.0
     rW: float = 0.0
     tW: float = 0.0
 
-    def place(self, p: Piece) -> bool:
-        dims = p.pallet_footprint_dims(self.L, self.W)
+    @property
+    def H_ext(self) -> float:
+        """Deck + tallest part + top clearance."""
+        if not self.pieces:
+            return self.H
+        return self.H + self.load_h + CRATE_SIDE_CLEAR
 
+    def footprint(self, p: Piece) -> Optional[Tuple[float, float]]:
+        base = max(p.w, p.h)
+        thick = p.stack_thickness()
+
+        if base <= self.L and thick <= self.W:
+            return base, thick
+        if base <= self.W and thick <= self.L:
+            return thick, base
+        return None
+
+    def place(self, p: Piece, lim: TransportLimits) -> bool:
+        dims = self.footprint(p)
         if not dims:
             return False
-
-        pL, pW = dims
 
         if self.weight + p.lbs > self.max_wgt:
             return False
 
-        # Continue current row.
-        if (
-            self.uL + pL <= self.L
-            and self.tW + max(self.rW, pW) <= self.W
-        ):
+        part_h = min(p.w, p.h)
+        if self.H + max(self.load_h, part_h) + CRATE_SIDE_CLEAR > lim.usable_ext_h:
+            return False
+
+        pL, pW = dims
+
+        if self.uL + pL <= self.L and self.tW + max(self.rW, pW) <= self.W:
             self.uL += pL
             self.rW = max(self.rW, pW)
-
-        # Start new row.
         else:
             if self.tW + self.rW + pW > self.W:
                 return False
-
             self.tW += self.rW
             self.uL = pL
             self.rW = pW
 
         self.pieces.append(p)
         self.weight += p.lbs
-
+        self.load_h = max(self.load_h, part_h)
         return True
+
 
 # ==========================================================
 # 4. WEIGHT / DEPTH / SPLIT LOGIC
@@ -572,16 +783,7 @@ class PalletObject:
 
 def is_lsd_type(unit_type: Any) -> bool:
     text = clean_str(unit_type).upper()
-
-    keywords = [
-        "LSD",
-        "LIFT",
-        "SLID",
-        "SLIDE",
-        "MULTISLIDE",
-        "MULTI-SLIDE",
-    ]
-
+    keywords = ["LSD", "LIFT", "SLID", "SLIDE", "MULTISLIDE", "MULTI-SLIDE"]
     return any(keyword in text for keyword in keywords)
 
 
@@ -594,15 +796,13 @@ def calculate_specs(
     lsd_multiplier: float,
 ) -> Tuple[float, float]:
     """
-    Returns:
-        depth_inches, estimated_weight_lbs
+    Returns (depth_inches, estimated_weight_lbs).
 
-    Important upgrade:
-    depth is now kept and used later in crate/pallet packing.
+    Depth: LSD / sliding 200 mm, other units 90 mm.
+    Weight: glass area x kg/m2 x total-weight multiplier.
     """
     is_lsd = is_lsd_type(unit_type)
-
-    depth = 7.87 if is_lsd else 3.54
+    depth = mm_to_in(200) if is_lsd else mm_to_in(90)
 
     area_m2 = (w * 0.0254) * (h * 0.0254)
     multiplier = lsd_multiplier if is_lsd else std_multiplier
@@ -611,82 +811,46 @@ def calculate_specs(
     return depth, weight_lbs
 
 
-def should_auto_slant(
-    piece: Piece,
-    max_h_int: float,
-) -> bool:
-    return (
-        piece.mode == "WHOLE"
-        and piece.oriented_vertical(max_h_int) > max_h_int
-    )
-
-
 def expand_manual_split(
     p: Piece,
     rows: int,
     cols: int,
-    mode_override: str,
-    orient_override: str,
-    frame_pct: float,
-    max_h_int: float,
+    a: LogisticsAssumptions,
 ) -> List[Piece]:
     """
     Splits one unit into rows x cols parts.
 
-    If DISASSEMBLED:
-      - panel pieces get the non-frame weight
-      - four frame kit sticks are added
+    WHOLE / SLANT : parts keep the mode; the transport class is chosen
+                    per part from the factory rules.
+    DISASSEMBLED  : panel parts carry the non-frame weight and four
+                    frame-kit sticks are added.
+                    No split  -> forced disassembly, frame kit 25 %
+                    Split     -> manual split, frame kit 15 %
     """
     rows = max(1, int(rows or 1))
     cols = max(1, int(cols or 1))
     part_count = rows * cols
 
-    mode_override = clean_str(mode_override).upper() or "WHOLE"
-    orient_override = clean_str(orient_override).upper() or "AUTO"
+    p.mode = clean_str(p.mode).upper() or "WHOLE"
+    p.orientation = clean_str(p.orientation).upper() or "AUTO"
 
-    if part_count <= 1:
-        p.mode = mode_override
-        p.orientation = orient_override
-
-        if should_auto_slant(p, max_h_int):
-            p.mode = "SLANT"
-
+    if p.mode != "DISASSEMBLED" and part_count == 1:
         return [p]
+
+    if p.mode == "DISASSEMBLED":
+        frame_pct = a.frame_kit_pct_disassembly if part_count == 1 else a.frame_kit_pct_split
+    else:
+        frame_pct = 0.0
+
+    kit_weight = p.lbs * frame_pct
+    panel_weight_each = max(0.0, p.lbs - kit_weight) / part_count
 
     part_w = p.w / cols
     part_h = p.h / rows
 
-    kit_weight = 0.0
-    if mode_override == "DISASSEMBLED":
-        kit_weight = p.lbs * frame_pct
-
-    panel_weight_total = max(0.0, p.lbs - kit_weight)
-    panel_weight_each = panel_weight_total / part_count
-
     parts: List[Piece] = []
 
     for i in range(part_count):
-        sub_mode = mode_override
-
-        if sub_mode != "DISASSEMBLED":
-            test_piece = Piece(
-                orig_id=p.orig_id,
-                piece_id=p.piece_id,
-                w=part_w,
-                h=part_h,
-                utype=p.utype,
-                d=p.d,
-                lbs=panel_weight_each,
-                mode="WHOLE",
-                orientation=orient_override,
-                source_order=p.source_order,
-            )
-
-            if test_piece.oriented_vertical(max_h_int) > max_h_int:
-                sub_mode = "SLANT"
-            else:
-                sub_mode = "WHOLE"
-
         parts.append(
             Piece(
                 orig_id=p.orig_id,
@@ -696,17 +860,16 @@ def expand_manual_split(
                 utype=f"{p.utype} (Part)",
                 d=p.d,
                 lbs=panel_weight_each,
-                mode=sub_mode,
-                orientation=orient_override,
+                mode=p.mode,
+                orientation=p.orientation,
                 source_order=p.source_order,
             )
         )
 
-    if mode_override == "DISASSEMBLED" and kit_weight > 0:
+    if p.mode == "DISASSEMBLED" and kit_weight > 0:
         stick_weight = kit_weight / 4.0
-        suffixes = ["V1", "V2", "H1", "H2"]
 
-        for suffix in suffixes:
+        for suffix in ["V1", "V2", "H1", "H2"]:
             stick_len = p.h if suffix.startswith("V") else p.w
 
             parts.append(
@@ -714,7 +877,7 @@ def expand_manual_split(
                     orig_id=p.orig_id,
                     piece_id=f"{p.piece_id}:KIT_{suffix}",
                     w=stick_len,
-                    h=6.0,
+                    h=FRAME_KIT_PROFILE_H,
                     utype="FRAME KIT",
                     d=p.d,
                     lbs=stick_weight,
@@ -726,9 +889,42 @@ def expand_manual_split(
 
     return parts
 
+
 # ==========================================================
 # 5. RAW PASTE PARSER
 # ==========================================================
+
+def make_master_row(
+    order_name: str,
+    item_id: str,
+    index: int,
+    width: float,
+    height: float,
+    unit_type: str,
+    depth: float,
+    lbs: float,
+    source: str,
+    notes: str = "",
+) -> Dict[str, Any]:
+    return {
+        "Order": order_name,
+        "ID": f"{order_name}|{item_id}#{index}",
+        "Orig": f"{order_name}|{item_id}",
+        "Mark": item_id,
+        "W": round(width, 3),
+        "H": round(height, 3),
+        "Type": unit_type,
+        "Qty": 1,
+        "Depth": round(depth, 3),
+        "Lbs": round(lbs, 1),
+        "Mode": "WHOLE",
+        "Orient": "AUTO",
+        "SR": 1,
+        "SC": 1,
+        "Source": source,
+        "Notes": notes,
+    }
+
 
 def parse_order_text_to_rows(
     order_name: str,
@@ -736,13 +932,8 @@ def parse_order_text_to_rows(
     assumptions: LogisticsAssumptions,
 ) -> Tuple[List[Dict[str, Any]], List[ValidationIssue]]:
     """
-    Expected paste format:
-        ID, W, H, Type, Qty
-
-    Delimiters supported:
-        comma
-        tab
-        two or more spaces
+    Expected paste format:  ID, W, H, Type, Qty
+    Delimiters: comma, tab, or two or more spaces.
     """
     rows: List[Dict[str, Any]] = []
     issues: List[ValidationIssue] = []
@@ -750,34 +941,32 @@ def parse_order_text_to_rows(
     if not clean_str(raw_text):
         return rows, issues
 
-    lines = [
-        line.rstrip()
-        for line in raw_text.splitlines()
-        if clean_str(line)
-    ]
+    lines = [line.rstrip() for line in raw_text.splitlines() if clean_str(line)]
+
+    def issue(line_no: int, item_id: str, problem: str, suggestion: str, line: str, severity: str = "ERROR") -> None:
+        issues.append(
+            ValidationIssue(
+                severity=severity,
+                source="Raw Paste",
+                row_no=line_no,
+                order=order_name,
+                item_id=item_id,
+                problem=problem,
+                suggestion=suggestion,
+                raw_value=line,
+            )
+        )
 
     for line_no, line in enumerate(lines, start=1):
         parts = re.split(r"\s*,\s*|\t+|\s{2,}", line.strip())
 
         if len(parts) < 5:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Raw Paste",
-                    row_no=line_no,
-                    order=order_name,
-                    item_id="",
-                    problem="Too few columns. Expected ID, W, H, Type, Qty.",
-                    suggestion="Use format like: A1, 36, 72, FIXED, 2",
-                    raw_value=line,
-                )
-            )
+            issue(line_no, "", "Too few columns. Expected ID, W, H, Type, Qty.",
+                  "Use format like: A1, 36, 72, FIXED, 2", line)
             continue
 
         if len(parts) > 5:
-            item_id_raw = parts[0]
-            width_raw = parts[1]
-            height_raw = parts[2]
+            item_id_raw, width_raw, height_raw = parts[0], parts[1], parts[2]
             qty_raw = parts[-1]
             type_raw = " ".join(parts[3:-1])
         else:
@@ -790,111 +979,33 @@ def parse_order_text_to_rows(
         unit_type = clean_str(type_raw)
 
         if not item_id:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Raw Paste",
-                    row_no=line_no,
-                    order=order_name,
-                    item_id="",
-                    problem="Missing item ID / mark.",
-                    suggestion="Add a unit ID or mark.",
-                    raw_value=line,
-                )
-            )
+            issue(line_no, "", "Missing item ID / mark.", "Add a unit ID or mark.", line)
             continue
-
         if width is None or width <= 0:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Raw Paste",
-                    row_no=line_no,
-                    order=order_name,
-                    item_id=item_id,
-                    problem="Width is missing, zero, or not numeric.",
-                    suggestion="Enter width in inches.",
-                    raw_value=line,
-                )
-            )
+            issue(line_no, item_id, "Width is missing, zero, or not numeric.", "Enter width in inches.", line)
             continue
-
         if height is None or height <= 0:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Raw Paste",
-                    row_no=line_no,
-                    order=order_name,
-                    item_id=item_id,
-                    problem="Height is missing, zero, or not numeric.",
-                    suggestion="Enter height in inches.",
-                    raw_value=line,
-                )
-            )
+            issue(line_no, item_id, "Height is missing, zero, or not numeric.", "Enter height in inches.", line)
             continue
-
         if qty is None or qty <= 0:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Raw Paste",
-                    row_no=line_no,
-                    order=order_name,
-                    item_id=item_id,
-                    problem="Quantity is missing, zero, or not numeric.",
-                    suggestion="Enter quantity as a positive whole number.",
-                    raw_value=line,
-                )
-            )
+            issue(line_no, item_id, "Quantity is missing, zero, or not numeric.",
+                  "Enter quantity as a positive whole number.", line)
             continue
 
         if not unit_type:
             unit_type = "STANDARD"
-            issues.append(
-                ValidationIssue(
-                    severity="WARNING",
-                    source="Raw Paste",
-                    row_no=line_no,
-                    order=order_name,
-                    item_id=item_id,
-                    problem="Type is blank.",
-                    suggestion="Default STANDARD assumptions were used.",
-                    raw_value=line,
-                )
-            )
+            issue(line_no, item_id, "Type is blank.", "Default STANDARD assumptions were used.", line, "WARNING")
 
         depth, lbs = calculate_specs(
-            unit_type,
-            width,
-            height,
+            unit_type, width, height,
             assumptions.glass_kg_m2,
             assumptions.std_weight_multiplier,
             assumptions.lsd_weight_multiplier,
         )
 
         for i in range(qty):
-            generated_id = f"{order_name}|{item_id}#{i + 1}"
-
             rows.append(
-                {
-                    "Order": order_name,
-                    "ID": generated_id,
-                    "Orig": f"{order_name}|{item_id}",
-                    "Mark": item_id,
-                    "W": round(width, 3),
-                    "H": round(height, 3),
-                    "Type": unit_type,
-                    "Qty": 1,
-                    "Depth": round(depth, 3),
-                    "Lbs": round(lbs, 1),
-                    "Mode": "WHOLE",
-                    "Orient": "AUTO",
-                    "SR": 1,
-                    "SC": 1,
-                    "Source": "Raw Paste",
-                    "Notes": "",
-                }
+                make_master_row(order_name, item_id, i + 1, width, height, unit_type, depth, lbs, "Raw Paste")
             )
 
     return rows, issues
@@ -905,59 +1016,76 @@ def parse_order_text_to_rows(
 # ==========================================================
 
 def read_uploaded_dataframe(uploaded_file) -> pd.DataFrame:
-    """
-    Reads CSV or Excel uploads into a DataFrame.
-    """
     file_name = uploaded_file.name.lower()
 
     if file_name.endswith(".csv"):
         return pd.read_csv(uploaded_file)
 
-    if (
-        file_name.endswith(".xlsx")
-        or file_name.endswith(".xlsm")
-        or file_name.endswith(".xls")
-    ):
+    if file_name.endswith((".xlsx", ".xlsm", ".xls")):
         return pd.read_excel(uploaded_file)
 
     raise ValueError("Unsupported file type. Upload CSV, XLSX, XLSM, or XLS.")
 
 
+def _norm_header(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).lower())
+
+
 def guess_column(
     columns: List[str],
     keywords: List[str],
+    exclude: Optional[List[str]] = None,
 ) -> str:
     """
-    Attempts to guess a source column based on keywords.
-    Returns '<none>' if no likely match is found.
-    """
-    normalized = {
-        col: re.sub(r"[^a-z0-9]+", "", str(col).lower())
-        for col in columns
-    }
+    Guesses a source column from keywords, in keyword priority order.
 
-    for col, simple in normalized.items():
-        for keyword in keywords:
-            key = re.sub(r"[^a-z0-9]+", "", keyword.lower())
-            if key and key in simple:
+    Pass 1: exact header match.
+    Pass 2: header contains keyword (keywords of 3+ characters only,
+            so "w" or "id" cannot match "Window" or "Width").
+    """
+    exclude = exclude or []
+    normalized = {col: _norm_header(col) for col in columns if col not in exclude}
+
+    for keyword in keywords:
+        key = _norm_header(keyword)
+        for col, simple in normalized.items():
+            if key and simple == key:
+                return col
+
+    for keyword in keywords:
+        key = _norm_header(keyword)
+        if len(key) < 3:
+            continue
+        for col, simple in normalized.items():
+            if key in simple:
                 return col
 
     return "<none>"
 
 
 def build_default_column_mapping(columns: List[str]) -> Dict[str, str]:
-    """
-    Best-effort mapping for common estimating spreadsheet headers.
-    """
+    width = guess_column(columns, ["width", "w", "imperial width", "si width", "wid"])
+    height = guess_column(columns, ["height", "h", "imperial height", "si height", "hgt"], exclude=[width])
+    taken = [c for c in [width, height] if c != "<none>"]
+
+    unit_id = guess_column(columns, ["mark", "type mark", "id", "unit id", "item", "position", "pos"], exclude=taken)
+    taken.append(unit_id)
+
+    qty = guess_column(columns, ["qty", "quantity", "count", "pcs"], exclude=taken)
+    taken.append(qty)
+
+    unit_type = guess_column(columns, ["type", "unit type", "system", "description"], exclude=taken)
+    taken.append(unit_type)
+
     return {
-        "id": guess_column(columns, ["id", "mark", "type mark", "window", "door"]),
-        "width": guess_column(columns, ["width", "w", "si width", "imperial width"]),
-        "height": guess_column(columns, ["height", "h", "si height", "imperial height"]),
-        "type": guess_column(columns, ["type", "system", "description", "unit type"]),
-        "qty": guess_column(columns, ["qty", "quantity", "count"]),
-        "depth": guess_column(columns, ["depth", "frame depth"]),
-        "weight": guess_column(columns, ["weight", "lbs", "pounds"]),
-        "notes": guess_column(columns, ["notes", "remarks", "comments"]),
+        "id": unit_id,
+        "width": width,
+        "height": height,
+        "type": unit_type,
+        "qty": qty,
+        "depth": guess_column(columns, ["depth", "frame depth"], exclude=taken),
+        "weight": guess_column(columns, ["weight", "lbs", "pounds"], exclude=taken),
+        "notes": guess_column(columns, ["notes", "remarks", "comments"], exclude=taken),
     }
 
 
@@ -969,19 +1097,8 @@ def normalize_uploaded_table(
     source_name: str,
 ) -> Tuple[List[Dict[str, Any]], List[ValidationIssue]]:
     """
-    Converts uploaded CSV/Excel rows into the app's master row format.
-
-    Required logical fields:
-        id
-        width
-        height
-
-    Optional:
-        type
-        qty
-        depth
-        weight
-        notes
+    Converts uploaded CSV/Excel rows into master rows.
+    Required: id, width, height. Optional: type, qty, depth, weight, notes.
     """
     rows: List[Dict[str, Any]] = []
     issues: List[ValidationIssue] = []
@@ -992,85 +1109,56 @@ def normalize_uploaded_table(
             return None
         return row[col]
 
-    for idx, row in df.iterrows():
-        row_no = int(idx) + 2
+    def issue(row_no: int, item_id: str, problem: str, suggestion: str, raw: str) -> None:
+        issues.append(
+            ValidationIssue(
+                severity="ERROR",
+                source=source_name,
+                row_no=row_no,
+                order=order_name,
+                item_id=item_id,
+                problem=problem,
+                suggestion=suggestion,
+                raw_value=raw,
+            )
+        )
+
+    for position, (_, row) in enumerate(df.iterrows()):
+        row_no = position + 2  # header is spreadsheet row 1
+
+        values = [clean_str(x) for x in row.tolist()]
+        if not any(values):
+            continue  # fully blank spreadsheet row
+
+        raw_preview = " | ".join(values[:10])
 
         item_id = clean_str(cell(row, "id"))
         width = safe_float(cell(row, "width"))
         height = safe_float(cell(row, "height"))
         unit_type = clean_str(cell(row, "type")) or "STANDARD"
-        qty = safe_int(cell(row, "qty"), 1) or 1
         notes = clean_str(cell(row, "notes"))
 
-        raw_preview = " | ".join(
-            clean_str(x)
-            for x in row.tolist()[:10]
-        )
+        qty_raw = cell(row, "qty")
+        qty = 1 if is_blank(qty_raw) else safe_int(qty_raw)
 
         if not item_id:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source=source_name,
-                    row_no=row_no,
-                    order=order_name,
-                    item_id="",
-                    problem="Missing ID / mark.",
-                    suggestion="Map the correct ID/mark column or fill missing marks.",
-                    raw_value=raw_preview,
-                )
-            )
+            issue(row_no, "", "Missing ID / mark.", "Map the correct ID/mark column or fill missing marks.", raw_preview)
             continue
-
         if width is None or width <= 0:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source=source_name,
-                    row_no=row_no,
-                    order=order_name,
-                    item_id=item_id,
-                    problem="Width is missing, zero, or not numeric.",
-                    suggestion="Map width column or enter width in inches.",
-                    raw_value=raw_preview,
-                )
-            )
+            issue(row_no, item_id, "Width is missing, zero, or not numeric.",
+                  "Map width column or enter width in inches.", raw_preview)
             continue
-
         if height is None or height <= 0:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source=source_name,
-                    row_no=row_no,
-                    order=order_name,
-                    item_id=item_id,
-                    problem="Height is missing, zero, or not numeric.",
-                    suggestion="Map height column or enter height in inches.",
-                    raw_value=raw_preview,
-                )
-            )
+            issue(row_no, item_id, "Height is missing, zero, or not numeric.",
+                  "Map height column or enter height in inches.", raw_preview)
             continue
-
-        if qty <= 0:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source=source_name,
-                    row_no=row_no,
-                    order=order_name,
-                    item_id=item_id,
-                    problem="Quantity is zero or negative.",
-                    suggestion="Use a positive quantity.",
-                    raw_value=raw_preview,
-                )
-            )
+        if qty is None or qty <= 0:
+            issue(row_no, item_id, "Quantity is zero, negative, or not numeric.",
+                  "Use a positive whole-number quantity.", raw_preview)
             continue
 
         calc_depth, calc_lbs = calculate_specs(
-            unit_type,
-            width,
-            height,
+            unit_type, width, height,
             assumptions.glass_kg_m2,
             assumptions.std_weight_multiplier,
             assumptions.lsd_weight_multiplier,
@@ -1083,192 +1171,287 @@ def normalize_uploaded_table(
         lbs = mapped_weight if mapped_weight and mapped_weight > 0 else calc_lbs
 
         for i in range(qty):
-            generated_id = f"{order_name}|{item_id}#{i + 1}"
-
             rows.append(
-                {
-                    "Order": order_name,
-                    "ID": generated_id,
-                    "Orig": f"{order_name}|{item_id}",
-                    "Mark": item_id,
-                    "W": round(width, 3),
-                    "H": round(height, 3),
-                    "Type": unit_type,
-                    "Qty": 1,
-                    "Depth": round(depth, 3),
-                    "Lbs": round(lbs, 1),
-                    "Mode": "WHOLE",
-                    "Orient": "AUTO",
-                    "SR": 1,
-                    "SC": 1,
-                    "Source": source_name,
-                    "Notes": notes,
-                }
+                make_master_row(order_name, item_id, i + 1, width, height, unit_type, depth, lbs, source_name, notes)
             )
 
     return rows, issues
 
+
 # ==========================================================
-# 7. MASTER TABLE VALIDATION
+# 7. MASTER TABLE NORMALIZATION & VALIDATION
 # ==========================================================
 
-def validation_issues_to_df(
-    issues: List[ValidationIssue],
+def normalize_master_df(
+    df: Optional[pd.DataFrame],
+    assumptions: LogisticsAssumptions,
 ) -> pd.DataFrame:
+    """
+    Cleans an edited master table so it can be packed:
+
+    - fills defaults for rows added in the editor (Order, Mark, Mode,
+      Orient, SR, SC, Type, Source)
+    - recalculates blank Depth / Lbs from W, H and Type
+    - generates a unique ID / Orig for rows where they are blank
+    """
+    if df is None:
+        return pd.DataFrame(columns=MASTER_COLUMNS)
+
+    out = df.copy()
+    for col in MASTER_COLUMNS:
+        if col not in out.columns:
+            out[col] = None
+    out = out[MASTER_COLUMNS].reset_index(drop=True)
+    out = out.astype(object)
+
+    # Drop rows that are completely empty (e.g. an added row never filled in).
+    meaningful = ["Mark", "W", "H", "ID"]
+    keep = [
+        any(not is_blank(out.at[i, c]) for c in meaningful)
+        for i in range(len(out))
+    ]
+    out = out[keep].reset_index(drop=True)
+
+    existing_ids = set(clean_str(x) for x in out["ID"] if clean_str(x))
+
+    for i in range(len(out)):
+        order = clean_str(out.at[i, "Order"]) or "Manual"
+        out.at[i, "Order"] = order
+
+        unit_id = clean_str(out.at[i, "ID"])
+        mark = clean_str(out.at[i, "Mark"])
+
+        if not mark and unit_id:
+            mark = unit_id.split("|", 1)[-1].split("#", 1)[0]
+        if not mark:
+            mark = f"ROW{i + 1}"
+        out.at[i, "Mark"] = mark
+
+        unit_type = clean_str(out.at[i, "Type"]) or "STANDARD"
+        out.at[i, "Type"] = unit_type
+
+        mode = clean_str(out.at[i, "Mode"]).upper() or "WHOLE"
+        orient = clean_str(out.at[i, "Orient"]).upper() or "AUTO"
+        out.at[i, "Mode"] = mode
+        out.at[i, "Orient"] = orient
+
+        out.at[i, "SR"] = safe_int(out.at[i, "SR"], 1)
+        out.at[i, "SC"] = safe_int(out.at[i, "SC"], 1)
+        out.at[i, "Qty"] = 1
+        out.at[i, "Source"] = clean_str(out.at[i, "Source"]) or "Manual Edit"
+        out.at[i, "Notes"] = clean_str(out.at[i, "Notes"])
+
+        width = safe_float(out.at[i, "W"])
+        height = safe_float(out.at[i, "H"])
+        out.at[i, "W"] = width
+        out.at[i, "H"] = height
+
+        depth = safe_float(out.at[i, "Depth"])
+        lbs = safe_float(out.at[i, "Lbs"])
+
+        if width and height and width > 0 and height > 0:
+            calc_depth, calc_lbs = calculate_specs(
+                unit_type, width, height,
+                assumptions.glass_kg_m2,
+                assumptions.std_weight_multiplier,
+                assumptions.lsd_weight_multiplier,
+            )
+            if depth is None or depth <= 0:
+                depth = round(calc_depth, 3)
+            if lbs is None or lbs <= 0:
+                lbs = round(calc_lbs, 1)
+
+        out.at[i, "Depth"] = depth
+        out.at[i, "Lbs"] = lbs
+
+        if not clean_str(out.at[i, "Orig"]):
+            out.at[i, "Orig"] = f"{order}|{mark}"
+
+        if not unit_id:
+            k = 1
+            candidate = f"{order}|{mark}#{k}"
+            while candidate in existing_ids:
+                k += 1
+                candidate = f"{order}|{mark}#{k}"
+            out.at[i, "ID"] = candidate
+            existing_ids.add(candidate)
+
+    return out
+
+
+def validation_issues_to_df(issues: List[ValidationIssue]) -> pd.DataFrame:
     if not issues:
         return pd.DataFrame()
-
     return pd.DataFrame([issue.to_dict() for issue in issues])
 
 
-def validate_master_dataframe(
-    df: pd.DataFrame,
-) -> List[ValidationIssue]:
+def validate_master_dataframe(df: pd.DataFrame) -> List[ValidationIssue]:
     issues: List[ValidationIssue] = []
 
-    if df is None or df.empty:
+    def add(row_no: Optional[int], order: str, item_id: str, problem: str, suggestion: str) -> None:
         issues.append(
             ValidationIssue(
                 severity="ERROR",
                 source="Master Table",
-                row_no=None,
-                order="",
-                item_id="",
-                problem="No unit data loaded.",
-                suggestion="Process pasted data or upload a CSV/Excel file.",
+                row_no=row_no,
+                order=order,
+                item_id=item_id,
+                problem=problem,
+                suggestion=suggestion,
             )
         )
+
+    if df is None or df.empty:
+        add(None, "", "", "No unit data loaded.", "Process pasted data or upload a CSV/Excel file.")
         return issues
 
-    required_columns = [
-        "Order",
-        "ID",
-        "W",
-        "H",
-        "Depth",
-        "Lbs",
-        "Mode",
-        "Orient",
-        "SR",
-        "SC",
-    ]
+    required_columns = ["Order", "ID", "Orig", "W", "H", "Type", "Depth", "Lbs", "Mode", "Orient", "SR", "SC"]
 
     for col in required_columns:
         if col not in df.columns:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Master Table",
-                    row_no=None,
-                    order="",
-                    item_id="",
-                    problem=f"Missing required column: {col}",
-                    suggestion="Reload/process the source data.",
-                )
-            )
+            add(None, "", "", f"Missing required column: {col}", "Reload/process the source data.")
 
     if issues:
         return issues
 
-    seen_ids: set[str] = set()
+    seen_ids: set = set()
 
-    for idx, row in df.iterrows():
-        row_no = int(idx) + 1
+    for position, (_, row) in enumerate(df.iterrows()):
+        row_no = position + 1
         order = clean_str(row.get("Order"))
         item_id = clean_str(row.get("ID"))
 
         if not item_id:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Master Table",
-                    row_no=row_no,
-                    order=order,
-                    item_id="",
-                    problem="Generated unit ID is blank.",
-                    suggestion="Check the source unit mark.",
-                )
-            )
+            add(row_no, order, "", "Generated unit ID is blank.", "Save the table to auto-generate IDs.")
         elif item_id in seen_ids:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Master Table",
-                    row_no=row_no,
-                    order=order,
-                    item_id=item_id,
-                    problem="Duplicate generated unit ID.",
-                    suggestion="Check order names and source marks.",
-                )
-            )
+            add(row_no, order, item_id, "Duplicate generated unit ID.", "Check order names and source marks.")
         else:
             seen_ids.add(item_id)
 
         for col in ["W", "H", "Depth", "Lbs"]:
             value = safe_float(row.get(col))
             if value is None or value <= 0:
-                issues.append(
-                    ValidationIssue(
-                        severity="ERROR",
-                        source="Master Table",
-                        row_no=row_no,
-                        order=order,
-                        item_id=item_id,
-                        problem=f"{col} must be positive numeric.",
-                        suggestion=f"Correct {col} before optimizing.",
-                    )
-                )
+                add(row_no, order, item_id, f"{col} must be positive numeric.", f"Correct {col} before optimizing.")
 
-        mode = clean_str(row.get("Mode")).upper()
-        if mode not in {"WHOLE", "SLANT", "DISASSEMBLED"}:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Master Table",
-                    row_no=row_no,
-                    order=order,
-                    item_id=item_id,
-                    problem="Invalid Mode.",
-                    suggestion="Use WHOLE, SLANT, or DISASSEMBLED.",
-                )
-            )
+        if clean_str(row.get("Mode")).upper() not in VALID_MODES:
+            add(row_no, order, item_id, "Invalid Mode.", "Use WHOLE, SLANT, or DISASSEMBLED.")
 
-        orient = clean_str(row.get("Orient")).upper()
-        if orient not in {"AUTO", "UPRIGHT", "SIDE"}:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Master Table",
-                    row_no=row_no,
-                    order=order,
-                    item_id=item_id,
-                    problem="Invalid Orient.",
-                    suggestion="Use AUTO, UPRIGHT, or SIDE.",
-                )
-            )
+        if clean_str(row.get("Orient")).upper() not in VALID_ORIENTS:
+            add(row_no, order, item_id, "Invalid Orient.", "Use AUTO, UPRIGHT, or SIDE.")
 
         sr = safe_int(row.get("SR"), 1)
         sc = safe_int(row.get("SC"), 1)
-
         if sr is None or sr < 1 or sc is None or sc < 1:
-            issues.append(
-                ValidationIssue(
-                    severity="ERROR",
-                    source="Master Table",
-                    row_no=row_no,
-                    order=order,
-                    item_id=item_id,
-                    problem="Invalid split rows/columns.",
-                    suggestion="SR and SC must be at least 1.",
-                )
-            )
+            add(row_no, order, item_id, "Invalid split rows/columns.", "SR and SC must be at least 1.")
 
     return issues
 
 
+# ==========================================================
+# 8. BUILD PIECES FROM MASTER TABLE
+# ==========================================================
+
+def row_to_piece(row: pd.Series) -> Optional[Piece]:
+    """Builds the base Piece for one master row, or None if the row is invalid."""
+    width = safe_float(row.get("W"))
+    height = safe_float(row.get("H"))
+    depth = safe_float(row.get("Depth"))
+    lbs = safe_float(row.get("Lbs"))
+
+    if not all(v is not None and v > 0 for v in [width, height, depth, lbs]):
+        return None
+
+    mode = clean_str(row.get("Mode")).upper() or "WHOLE"
+    orient = clean_str(row.get("Orient")).upper() or "AUTO"
+
+    if mode not in VALID_MODES or orient not in VALID_ORIENTS:
+        return None
+
+    return Piece(
+        orig_id=clean_str(row.get("Orig")),
+        piece_id=clean_str(row.get("ID")),
+        w=float(width),
+        h=float(height),
+        utype=clean_str(row.get("Type")),
+        d=float(depth),
+        lbs=float(lbs),
+        mode=mode,
+        orientation=orient,
+        source_order=clean_str(row.get("Order")),
+    )
+
+
+def glass_note(transport_class: str, utype: str) -> str:
+    if utype == "FRAME KIT":
+        return "N/A"
+    if transport_class == CLASS_LOW:
+        return "SHIP SEPARATELY"
+    if transport_class == CLASS_SLANT:
+        return "IN UNIT (confirm)"
+    if transport_class == CLASS_OVERSIZE:
+        return "-"
+    return "IN UNIT"
+
+
+def build_pieces_from_master(
+    df: pd.DataFrame,
+    vehicle_data: Dict[str, float],
+    assumptions: LogisticsAssumptions,
+) -> Tuple[List[Piece], pd.DataFrame]:
+    """
+    Converts the master table into final pieces.
+    Returns (pieces, packing_decision_df). Invalid rows are skipped.
+    """
+    lim = get_transport_limits(vehicle_data, assumptions)
+
+    pieces: List[Piece] = []
+    decision_rows: List[Dict[str, Any]] = []
+
+    for _, row in df.iterrows():
+        base_piece = row_to_piece(row)
+        if base_piece is None:
+            continue
+
+        split_rows = safe_int(row.get("SR"), 1) or 1
+        split_cols = safe_int(row.get("SC"), 1) or 1
+
+        expanded = expand_manual_split(base_piece, split_rows, split_cols, assumptions)
+        pieces.extend(expanded)
+
+        for p in expanded:
+            orient, cls = p.plan(lim)
+            single = Crate(order=p.source_order, pclass=cls if cls != CLASS_DIS else CLASS_STD)
+            single.add(p)
+            pkg_l, pkg_w, pkg_h = single.dims(lim)
+
+            decision_rows.append(
+                {
+                    "Order": p.source_order,
+                    "Original Unit": base_piece.piece_id,
+                    "Final Piece": p.piece_id,
+                    "Mode": p.mode,
+                    "Orientation": orient,
+                    "Transport Class": cls,
+                    "Glass": glass_note(cls, p.utype),
+                    "W": round(p.w, 1),
+                    "H": round(p.h, 1),
+                    "Vertical H": round(p.vertical(lim), 1),
+                    "Vertical mm": round(in_to_mm(p.vertical(lim))),
+                    "Depth": round(p.d, 2),
+                    "Lbs": round(p.lbs, 1),
+                    "Split Rows": split_rows,
+                    "Split Cols": split_cols,
+                    "Single-Unit Pkg L": round(pkg_l, 1),
+                    "Single-Unit Pkg W": round(pkg_w, 1),
+                    "Single-Unit Pkg H": round(pkg_h, 1),
+                }
+            )
+
+    return pieces, pd.DataFrame(decision_rows)
+
 
 # ==========================================================
-# 8. PRACTICAL UNIT ISSUE REPORT
+# 9. PRACTICAL UNIT ISSUE REPORT
 # ==========================================================
 
 def build_unit_issue_report(
@@ -1277,234 +1460,128 @@ def build_unit_issue_report(
     assumptions: LogisticsAssumptions,
 ) -> pd.DataFrame:
     """
-    Builds a practical issue report for oversized/heavy units.
+    Per-piece report using the SAME rules as the optimizer, so it
+    reflects the current Mode / Orient / split settings.
 
-    This is more useful than only saying "too tall" because it shows:
-      - whether the unit fits upright
-      - whether it fits sideways
-      - whether slanting could work
-      - estimated slant length
-      - projected crate height
-      - recommended action
+    Severity:
+      ERROR    cannot ship as set (oversize, crate/vehicle limits)
+      WARNING  ships, but with factory restrictions (low-floor, no glass)
+      INFO     ships, worth knowing (slant rack, turned on side)
     """
     if df is None or df.empty:
         return pd.DataFrame()
 
-    max_h_int = get_vehicle_internal_crate_height_limit(
-        vehicle_data,
-        assumptions.vehicle_height_clearance,
-    )
+    lim = get_transport_limits(vehicle_data, assumptions)
+    pieces, _ = build_pieces_from_master(df, vehicle_data, assumptions)
 
-    max_h_ext = get_vehicle_external_crate_height_limit(
-        vehicle_data,
-        assumptions.vehicle_height_clearance,
-    )
+    rows: List[Dict[str, Any]] = []
 
-    issue_rows: List[Dict[str, Any]] = []
-
-    for _, row in df.iterrows():
-        order = clean_str(row.get("Order"))
-        unit_id = clean_str(row.get("ID"))
-
-        width = float(row.get("W", 0))
-        height = float(row.get("H", 0))
-        depth = float(row.get("Depth", 0))
-        lbs = float(row.get("Lbs", 0))
-
-        mode = clean_str(row.get("Mode")).upper() or "WHOLE"
-        orient = clean_str(row.get("Orient")).upper() or "AUTO"
-
-        fits_upright = height <= max_h_int
-        fits_sideways = width <= max_h_int
-
-        slant_needed = height > max_h_int
-        slant_run = 0.0
-        slant_length_ext = ""
-
-        if slant_needed:
-            slant_run = math.sqrt(max(0.0, height ** 2 - max_h_int ** 2))
-            slant_length_ext = round(width + slant_run + 2 * CRATE_SIDE_CLEAR, 1)
-
-        projected_crate_h_ext = min(height, max_h_int) + 2 * CRATE_SIDE_CLEAR
-        projected_crate_w_ext = CRATE_BASE_DEPTH + depth + UNIT_SPACER
+    for p in pieces:
+        orient, cls = p.plan(lim)
+        vertical = p.vertical(lim)
 
         problems: List[str] = []
-        recommendations: List[str] = []
+        recs: List[str] = []
+        severity = ""
 
-        if not fits_upright and fits_sideways:
-            problems.append("Too tall upright")
-            recommendations.append("Try SIDE orientation if acceptable")
+        if cls == CLASS_OVERSIZE:
+            severity = "ERROR"
+            if p.mode == "DISASSEMBLED":
+                problems.append(
+                    f'Disassembled part {min(p.w, p.h):.1f}" still taller than standard limit {lim.std_max_v:.1f}"'
+                )
+                recs.append("Increase split rows/columns (SR/SC)")
+            else:
+                problems.append(
+                    f'Vertical {vertical:.1f}" ({in_to_mm(vertical):,.0f} mm) exceeds every factory option '
+                    f'(standard {lim.std_max_v:.1f}", low-floor {lim.low_floor_max_v:.1f}", '
+                    f'slant {lim.slant_max_v:.1f}")'
+                )
+                recs.append("Split (SR/SC) or set Mode = DISASSEMBLED")
+        elif cls == CLASS_LOW:
+            severity = "WARNING"
+            problems.append("Low-floor pallet: ships WITHOUT glass; not suitable for transshipment/handling")
+            recs.append("Glazing ships separately; confirm with factory, or split / slant instead")
+        elif cls == CLASS_SLANT:
+            severity = "INFO"
+            problems.append(f'Ships on slant rack (vertical {vertical:.1f}" leaned to {lim.slant_target_v:.1f}")')
+            recs.append("Confirm with factory whether glass ships in the unit")
+        elif orient == "SIDE" and p.orientation == "AUTO":
+            severity = "INFO"
+            problems.append("Turned on its side to fit standard height")
+            recs.append("Confirm the unit may ship on its side")
 
-        if not fits_upright and not fits_sideways:
-            problems.append("Too tall in both orientations")
-            recommendations.append("Use SLANT, split, or DISASSEMBLED")
-
-        if slant_needed and slant_length_ext != "":
-            if float(slant_length_ext) > assumptions.crate_max_len_ext:
-                problems.append("Slant length exceeds crate length")
-                recommendations.append("Split or disassemble")
-
-        if projected_crate_h_ext > max_h_ext:
-            problems.append("Projected crate height exceeds selected vehicle")
-            recommendations.append("Split, side-orient, or choose taller vehicle")
-
-        if projected_crate_w_ext > assumptions.crate_max_width_ext:
-            problems.append("Single-unit crate depth exceeds crate width")
-            recommendations.append("Review depth, crate standard, or disassembly")
-
-        if lbs > assumptions.max_crate_lbs:
-            problems.append("Unit exceeds max crate weight")
-            recommendations.append("Split or disassemble")
-
-        if mode == "WHOLE" and not fits_upright:
-            problems.append("WHOLE mode may not fit upright")
-            recommendations.append("Change Mode or Orientation before optimizing")
+        if cls != CLASS_OVERSIZE:
+            single = Crate(order=p.source_order, pclass=cls if cls != CLASS_DIS else CLASS_STD)
+            single.add(p)
+            violations = single.limit_violations(lim, assumptions)
+            if violations:
+                severity = "ERROR"
+                problems.append("Single-unit package: " + ", ".join(violations).lower())
+                recs.append("Split or disassemble, or review crate limits / vehicle")
+            pkg = single.dims(lim)
+        else:
+            pkg = (0.0, 0.0, 0.0)
 
         if not problems:
             continue
 
-        severity = "ERROR" if any(
-            word in " ".join(problems).lower()
-            for word in ["exceeds", "too tall in both", "weight"]
-        ) else "WARNING"
-
-        issue_rows.append(
+        rows.append(
             {
                 "Severity": severity,
-                "Order": order,
-                "ID": unit_id,
-                "W": round(width, 1),
-                "H": round(height, 1),
-                "Depth": round(depth, 1),
-                "Lbs": round(lbs, 0),
-                "Mode": mode,
-                "Orient": orient,
-                "Vehicle Internal H Limit": round(max_h_int, 1),
-                "Fits Upright": "YES" if fits_upright else "NO",
-                "Fits Sideways": "YES" if fits_sideways else "NO",
-                "Slant Length Ext": slant_length_ext,
-                "Projected Crate H Ext": round(projected_crate_h_ext, 1),
-                "Projected Crate W Ext": round(projected_crate_w_ext, 1),
+                "Order": p.source_order,
+                "Unit": p.orig_id,
+                "Piece": p.piece_id,
+                "W": round(p.w, 1),
+                "H": round(p.h, 1),
+                "Mode": p.mode,
+                "Orientation": orient,
+                "Transport Class": cls,
+                "Vertical H": round(vertical, 1),
+                "Vertical mm": round(in_to_mm(vertical)),
+                "Lbs": round(p.lbs, 0),
+                "Pkg L": round(pkg[0], 1),
+                "Pkg W": round(pkg[1], 1),
+                "Pkg H": round(pkg[2], 1),
                 "Problem": "; ".join(dict.fromkeys(problems)),
-                "Recommendation": "; ".join(dict.fromkeys(recommendations)),
+                "Recommendation": "; ".join(dict.fromkeys(recs)),
             }
         )
 
-    return pd.DataFrame(issue_rows)
+    report = pd.DataFrame(rows)
+    if not report.empty:
+        order = {"ERROR": 0, "WARNING": 1, "INFO": 2}
+        report = report.sort_values(
+            by="Severity", key=lambda s: s.map(order), kind="stable"
+        ).reset_index(drop=True)
+    return report
 
 
 def show_issue_summary(issue_df: pd.DataFrame) -> None:
-    """
-    Streamlit helper for displaying issue reports.
-    """
     if issue_df is None or issue_df.empty:
-        st.success("No major dimensional/weight issues detected for the selected vehicle.")
+        st.success("No dimensional/weight issues detected for the selected vehicle.")
         return
 
-    error_count = len(issue_df[issue_df["Severity"] == "ERROR"])
-    warning_count = len(issue_df[issue_df["Severity"] == "WARNING"])
-
-    if error_count:
-        st.error(f"{error_count} critical issue(s) found.")
-
-    if warning_count:
-        st.warning(f"{warning_count} warning(s) found.")
+    counts = issue_df["Severity"].value_counts()
+    if counts.get("ERROR", 0):
+        st.error(f"{counts['ERROR']} piece(s) cannot ship as set.")
+    if counts.get("WARNING", 0):
+        st.warning(f"{counts['WARNING']} piece(s) ship with factory restrictions (low-floor, no glass).")
+    if counts.get("INFO", 0):
+        st.info(f"{counts['INFO']} piece(s) ship on a slant rack or on their side.")
 
     st.dataframe(issue_df, use_container_width=True, hide_index=True)
 
-# ==========================================================
-# 9. BUILD PIECES FROM MASTER TABLE
-# ==========================================================
-
-def build_pieces_from_master(
-    df: pd.DataFrame,
-    vehicle_data: Dict[str, float],
-    assumptions: LogisticsAssumptions,
-) -> Tuple[List[Piece], pd.DataFrame]:
-    """
-    Converts the editable master table into final pieces.
-
-    Returns:
-        pieces
-        packing_decision_df
-    """
-    max_h_int = get_vehicle_internal_crate_height_limit(
-        vehicle_data,
-        assumptions.vehicle_height_clearance,
-    )
-
-    pieces: List[Piece] = []
-    decision_rows: List[Dict[str, Any]] = []
-
-    for _, row in df.iterrows():
-        base_piece = Piece(
-            orig_id=clean_str(row["Orig"]),
-            piece_id=clean_str(row["ID"]),
-            w=float(row["W"]),
-            h=float(row["H"]),
-            utype=clean_str(row["Type"]),
-            d=float(row["Depth"]),
-            lbs=float(row["Lbs"]),
-            mode=clean_str(row["Mode"]).upper(),
-            orientation=clean_str(row["Orient"]).upper(),
-            source_order=clean_str(row["Order"]),
-        )
-
-        split_rows = safe_int(row.get("SR"), 1) or 1
-        split_cols = safe_int(row.get("SC"), 1) or 1
-
-        expanded = expand_manual_split(
-            base_piece,
-            split_rows,
-            split_cols,
-            base_piece.mode,
-            base_piece.orientation,
-            assumptions.frame_kit_weight_pct,
-            max_h_int,
-        )
-
-        pieces.extend(expanded)
-
-        for p in expanded:
-            decision_rows.append(
-                {
-                    "Order": p.source_order,
-                    "Original Unit": base_piece.piece_id,
-                    "Final Piece": p.piece_id,
-                    "Mode": p.mode,
-                    "Orientation": p.resolved_orientation(max_h_int),
-                    "W": round(p.w, 1),
-                    "H": round(p.h, 1),
-                    "Depth": round(p.d, 2),
-                    "Lbs": round(p.lbs, 1),
-                    "Split Rows": split_rows,
-                    "Split Cols": split_cols,
-                    "Internal Crate H Limit": round(max_h_int, 1),
-                    "Required Crate Length Int": round(p.crate_len_need_int(max_h_int), 1),
-                    "Effective Vertical H": round(p.crate_eff_vertical_h(max_h_int), 1),
-                }
-            )
-
-    return pieces, pd.DataFrame(decision_rows)
 
 # ==========================================================
 # 10. PALLETIZE AND CRATE PIECES
 # ==========================================================
 
-def group_pieces_for_packing(
-    pieces: List[Piece],
-    no_mixing_orders: bool,
-) -> Dict[str, List[Piece]]:
-    """
-    Groups pieces by order if no-mixing is enabled.
-    Otherwise uses one mixed group.
-    """
+def group_pieces_for_packing(pieces: List[Piece], no_mixing_orders: bool) -> Dict[str, List[Piece]]:
     grouped: Dict[str, List[Piece]] = {}
-
     for p in pieces:
-        group_key = p.source_order if no_mixing_orders else "MIXED ORDERS"
-        grouped.setdefault(group_key, []).append(p)
-
+        key = p.source_order if no_mixing_orders else "MIXED ORDERS"
+        grouped.setdefault(key, []).append(p)
     return grouped
 
 
@@ -1513,58 +1590,35 @@ def palletize_disassembled_pieces(
     pieces: List[Piece],
     selected_pallet_names: List[str],
     pallet_catalog: Dict[str, Dict[str, float]],
+    lim: TransportLimits,
     assumptions: LogisticsAssumptions,
 ) -> Tuple[List[PalletObject], List[Piece]]:
     """
-    Attempts to place DISASSEMBLED pieces on pallets.
-
-    Returns:
-        pallets
-        leftover pieces that could not be palletized
+    Places DISASSEMBLED parts (standing on edge) on pallets, first fit.
+    Returns (pallets, leftovers that go to crates).
     """
+    if not assumptions.allow_pallets_for_disassembled or not selected_pallet_names:
+        return [], list(pieces)
+
     pallets: List[PalletObject] = []
     leftovers: List[Piece] = []
 
-    if not assumptions.allow_pallets_for_disassembled:
-        return pallets, pieces
-
-    if not selected_pallet_names:
-        return pallets, pieces
-
-    sorted_pieces = sorted(
-        pieces,
-        key=lambda x: x.w * x.h,
-        reverse=True,
-    )
-
-    for p in sorted_pieces:
-        placed = False
-
-        for pallet in pallets:
-            if pallet.place(p):
-                placed = True
-                break
-
-        if placed:
+    for p in sorted(pieces, key=lambda x: x.w * x.h, reverse=True):
+        if any(pallet.place(p, lim) for pallet in pallets):
             continue
 
+        placed = False
         for pallet_name in selected_pallet_names:
             spec = pallet_catalog[pallet_name]
-            max_lbs = min(
-                float(spec.get("max_lbs", assumptions.max_pallet_lbs)),
-                assumptions.max_pallet_lbs,
-            )
-
             new_pallet = PalletObject(
                 order=order_name,
                 name=pallet_name,
                 L=float(spec["L"]),
                 W=float(spec["W"]),
                 H=float(spec.get("H", PALLET_H)),
-                max_wgt=max_lbs,
+                max_wgt=min(float(spec.get("max_lbs", assumptions.max_pallet_lbs)), assumptions.max_pallet_lbs),
             )
-
-            if new_pallet.place(p):
+            if new_pallet.place(p, lim):
                 pallets.append(new_pallet)
                 placed = True
                 break
@@ -1578,103 +1632,71 @@ def palletize_disassembled_pieces(
 def crate_pieces(
     order_name: str,
     pieces: List[Piece],
-    vehicle_data: Dict[str, float],
+    lim: TransportLimits,
     assumptions: LogisticsAssumptions,
 ) -> Tuple[List[Crate], List[Dict[str, Any]]]:
     """
-    Creates crates from pieces.
+    First-fit-decreasing crating.
 
-    Uses selected vehicle height to determine allowed crate height.
+    - Pieces only share a package with pieces of the same transport class
+      (standard crate, low-floor pallet, slant rack).
+    - Each piece goes into the first open package of its class that still
+      meets every limit; otherwise a new package is opened.
+    - Pieces that cannot meet the limits even alone get their own
+      flagged problem package so they stay visible in the manifest.
     """
-    max_h_int = get_vehicle_internal_crate_height_limit(
-        vehicle_data,
-        assumptions.vehicle_height_clearance,
-    )
-
-    max_h_ext = get_vehicle_external_crate_height_limit(
-        vehicle_data,
-        assumptions.vehicle_height_clearance,
-    )
-
     crates: List[Crate] = []
-    packing_notes: List[Dict[str, Any]] = []
+    notes: List[Dict[str, Any]] = []
 
     sorted_pieces = sorted(
         pieces,
-        key=lambda x: (
-            x.oriented_vertical(max_h_int),
-            x.crate_len_need_int(max_h_int),
-            x.lbs,
-        ),
+        key=lambda x: (x.vertical(lim), x.base(lim), x.lbs),
         reverse=True,
     )
 
-    current = Crate(order=order_name)
-
     for p in sorted_pieces:
-        can_add, reason = current.can_add(
-            p=p,
-            max_h_int=max_h_int,
-            max_crate_lbs=assumptions.max_crate_lbs,
-            max_len_ext=assumptions.crate_max_len_ext,
-            max_width_ext=assumptions.crate_max_width_ext,
-            max_height_ext=max_h_ext,
-        )
+        cls = p.transport_class(lim)
 
-        if can_add:
-            current.add(p, max_h_int)
-            packing_notes.append(
-                {
-                    "Piece": p.piece_id,
-                    "Assigned": "Current crate",
-                    "Reason": "fits",
-                }
-            )
+        if cls == CLASS_OVERSIZE:
+            problem = Crate(order=order_name, pclass=CLASS_OVERSIZE, problem="OVERSIZE: split or disassemble")
+            problem.add(p)
+            crates.append(problem)
+            notes.append({"Piece": p.piece_id, "Class": cls, "Assigned": "Problem package",
+                          "Reason": "exceeds all factory transport options"})
             continue
 
-        if current.pieces:
-            crates.append(current)
-            current = Crate(order=order_name)
+        package_class = CLASS_STD if cls == CLASS_DIS else cls
+        target = None
 
-        can_add_empty, reason_empty = current.can_add(
-            p=p,
-            max_h_int=max_h_int,
-            max_crate_lbs=assumptions.max_crate_lbs,
-            max_len_ext=assumptions.crate_max_len_ext,
-            max_width_ext=assumptions.crate_max_width_ext,
-            max_height_ext=max_h_ext,
-        )
+        for c in crates:
+            if c.problem or c.pclass != package_class:
+                continue
+            ok, _ = c.can_add(p, lim, assumptions)
+            if ok:
+                target = c
+                break
 
-        if can_add_empty:
-            current.add(p, max_h_int)
-            packing_notes.append(
-                {
-                    "Piece": p.piece_id,
-                    "Assigned": "New crate",
-                    "Reason": reason,
-                }
-            )
+        if target is not None:
+            target.add(p)
+            notes.append({"Piece": p.piece_id, "Class": cls, "Assigned": "Existing package", "Reason": "fits"})
+            continue
+
+        new_crate = Crate(order=order_name, pclass=package_class)
+        ok, reason = new_crate.can_add(p, lim, assumptions)
+
+        if not ok:
+            new_crate.problem = reason.upper()
+            notes.append({"Piece": p.piece_id, "Class": cls, "Assigned": "Problem package",
+                          "Reason": f"does not meet limits alone: {reason}"})
         else:
-            # Still put it in its own crate so it is visible in manifest,
-            # but flag it as a problem.
-            problem_crate = Crate(order=order_name)
-            problem_crate.add(p, max_h_int)
-            crates.append(problem_crate)
+            notes.append({"Piece": p.piece_id, "Class": cls, "Assigned": "New package",
+                          "Reason": "no open package of this class had room"})
 
-            packing_notes.append(
-                {
-                    "Piece": p.piece_id,
-                    "Assigned": "Problem crate",
-                    "Reason": f"Does not meet crate limits: {reason_empty}",
-                }
-            )
+        new_crate.add(p)
+        crates.append(new_crate)
 
-            current = Crate(order=order_name)
+    return crates, notes
 
-    if current.pieces:
-        crates.append(current)
-
-    return crates, packing_notes
 
 # ==========================================================
 # 11. 2D CONTAINER FLOOR PACKING
@@ -1685,33 +1707,32 @@ def pack_items_2d_maxrects(
     container_L: float,
     container_W: float,
     clearance: float,
+    max_weight: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Simple 2D max-rects style floor-packing heuristic.
-
-    Returns:
-        placed items
-        overflow items
+    Max-rects floor packing (best short side fit, no stacking).
+    Items that would push the load over max_weight are left for the next vehicle.
+    Each placed item gets x, y, L, W (as placed) and rotated=True/False.
     """
     placed: List[Dict[str, Any]] = []
     overflow: List[Dict[str, Any]] = []
+    load_weight = 0.0
 
-    free_rects: List[Dict[str, float]] = [
-        {
-            "x": 0.0,
-            "y": 0.0,
-            "L": container_L,
-            "W": container_W,
-        }
-    ]
+    free_rects: List[Dict[str, float]] = [{"x": 0.0, "y": 0.0, "L": container_L, "W": container_W}]
 
     sorted_items = sorted(
         [dict(item) for item in items],
-        key=lambda x: x["L"] * x["W"],
+        key=lambda x: float(x["L"]) * float(x["W"]),
         reverse=True,
     )
 
     for item in sorted_items:
+        item_weight = float(item.get("weight", 0) or 0)
+
+        if max_weight and max_weight > 0 and load_weight + item_weight > max_weight:
+            overflow.append(item)
+            continue
+
         best_fit = None
         best_short_side = float("inf")
 
@@ -1719,27 +1740,21 @@ def pack_items_2d_maxrects(
         req_W = float(item["W"]) + clearance
 
         orientations = [
-            (req_L, req_W, float(item["L"]), float(item["W"])),
-            (req_W, req_L, float(item["W"]), float(item["L"])),
+            (req_L, req_W, float(item["L"]), float(item["W"]), False),
+            (req_W, req_L, float(item["W"]), float(item["L"]), True),
         ]
 
         for fr in free_rects:
-            for used_L, used_W, actual_L, actual_W in orientations:
-                if used_L <= fr["L"] and used_W <= fr["W"]:
-                    short_side = min(
-                        fr["L"] - used_L,
-                        fr["W"] - used_W,
-                    )
-
+            for used_L, used_W, actual_L, actual_W, rotated in orientations:
+                if used_L <= fr["L"] + 1e-9 and used_W <= fr["W"] + 1e-9:
+                    short_side = min(fr["L"] - used_L, fr["W"] - used_W)
                     if short_side < best_short_side:
                         best_short_side = short_side
                         best_fit = {
-                            "x": fr["x"],
-                            "y": fr["y"],
-                            "used_L": used_L,
-                            "used_W": used_W,
-                            "actual_L": actual_L,
-                            "actual_W": actual_W,
+                            "x": fr["x"], "y": fr["y"],
+                            "used_L": used_L, "used_W": used_W,
+                            "actual_L": actual_L, "actual_W": actual_W,
+                            "rotated": rotated,
                         }
 
         if best_fit is None:
@@ -1753,279 +1768,227 @@ def pack_items_2d_maxrects(
                 "y": best_fit["y"],
                 "L": best_fit["actual_L"],
                 "W": best_fit["actual_W"],
+                "rotated": best_fit["rotated"],
             }
         )
         placed.append(placed_item)
+        load_weight += item_weight
 
-        used_x = best_fit["x"]
-        used_y = best_fit["y"]
-        used_L = best_fit["used_L"]
-        used_W = best_fit["used_W"]
+        ux, uy = best_fit["x"], best_fit["y"]
+        uL, uW = best_fit["used_L"], best_fit["used_W"]
 
         new_free: List[Dict[str, float]] = []
 
         for fr in free_rects:
             no_overlap = (
-                used_x >= fr["x"] + fr["L"]
-                or used_x + used_L <= fr["x"]
-                or used_y >= fr["y"] + fr["W"]
-                or used_y + used_W <= fr["y"]
+                ux >= fr["x"] + fr["L"]
+                or ux + uL <= fr["x"]
+                or uy >= fr["y"] + fr["W"]
+                or uy + uW <= fr["y"]
             )
-
             if no_overlap:
                 new_free.append(fr)
                 continue
 
-            # Left remainder.
-            if used_x > fr["x"]:
-                new_free.append(
-                    {
-                        "x": fr["x"],
-                        "y": fr["y"],
-                        "L": used_x - fr["x"],
-                        "W": fr["W"],
-                    }
-                )
+            if ux > fr["x"]:
+                new_free.append({"x": fr["x"], "y": fr["y"], "L": ux - fr["x"], "W": fr["W"]})
+            if ux + uL < fr["x"] + fr["L"]:
+                new_free.append({"x": ux + uL, "y": fr["y"], "L": fr["x"] + fr["L"] - (ux + uL), "W": fr["W"]})
+            if uy > fr["y"]:
+                new_free.append({"x": fr["x"], "y": fr["y"], "L": fr["L"], "W": uy - fr["y"]})
+            if uy + uW < fr["y"] + fr["W"]:
+                new_free.append({"x": fr["x"], "y": uy + uW, "L": fr["L"], "W": fr["y"] + fr["W"] - (uy + uW)})
 
-            # Right remainder.
-            if used_x + used_L < fr["x"] + fr["L"]:
-                new_free.append(
-                    {
-                        "x": used_x + used_L,
-                        "y": fr["y"],
-                        "L": (fr["x"] + fr["L"]) - (used_x + used_L),
-                        "W": fr["W"],
-                    }
-                )
-
-            # Bottom remainder.
-            if used_y > fr["y"]:
-                new_free.append(
-                    {
-                        "x": fr["x"],
-                        "y": fr["y"],
-                        "L": fr["L"],
-                        "W": used_y - fr["y"],
-                    }
-                )
-
-            # Top remainder.
-            if used_y + used_W < fr["y"] + fr["W"]:
-                new_free.append(
-                    {
-                        "x": fr["x"],
-                        "y": used_y + used_W,
-                        "L": fr["L"],
-                        "W": (fr["y"] + fr["W"]) - (used_y + used_W),
-                    }
-                )
-
-        free_rects = [
-            r
-            for r in new_free
-            if r["L"] > 1.0 and r["W"] > 1.0
-        ]
+        # Drop slivers and rectangles fully contained in another.
+        new_free = [r for r in new_free if r["L"] > 1.0 and r["W"] > 1.0]
+        pruned: List[Dict[str, float]] = []
+        for i, r in enumerate(new_free):
+            contained = False
+            for j, o in enumerate(new_free):
+                if i == j:
+                    continue
+                if (
+                    r["x"] >= o["x"] and r["y"] >= o["y"]
+                    and r["x"] + r["L"] <= o["x"] + o["L"]
+                    and r["y"] + r["W"] <= o["y"] + o["W"]
+                    and (r != o or j < i)
+                ):
+                    contained = True
+                    break
+            if not contained:
+                pruned.append(r)
+        free_rects = pruned
 
     return placed, overflow
+
 
 def pack_across_multiple_containers(
     items: List[Dict[str, Any]],
     vehicle_name: str,
     vehicle_data: Dict[str, float],
     assumptions: LogisticsAssumptions,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
-    Repeats 2D floor packing until all items are placed or no progress is possible.
+    Fills vehicles one after another.
+
+    Returns (loads, unpacked). Packages that can never be loaded
+    (too tall for the door, too big for the floor, heavier than the
+    payload) go straight to unpacked, with a reason, and never create
+    an empty vehicle.
     """
+    lim = get_transport_limits(vehicle_data, assumptions)
     container_L = float(vehicle_data["L"])
     container_W = float(vehicle_data["W"])
-    container_H = float(vehicle_data["H"])
-    container_payload = float(vehicle_data.get("max_lbs", 0) or 0)
+    payload = float(vehicle_data.get("max_lbs", 0) or 0)
 
-    remaining = [dict(item) for item in items]
+    loadable: List[Dict[str, Any]] = []
+    unpacked: List[Dict[str, Any]] = []
+
+    for item in items:
+        reasons = []
+        if float(item.get("H", 0)) > lim.usable_ext_h + 1e-6:
+            reasons.append("taller than vehicle/door limit")
+        if not lim.fits_floor(float(item["L"]), float(item["W"])):
+            reasons.append("footprint larger than vehicle floor")
+        if payload > 0 and float(item.get("weight", 0)) > payload:
+            reasons.append("heavier than vehicle payload")
+
+        if reasons:
+            bad = dict(item)
+            bad["unpacked_reason"] = "; ".join(reasons)
+            unpacked.append(bad)
+        else:
+            loadable.append(dict(item))
+
     loads: List[Dict[str, Any]] = []
+    remaining = loadable
+    floor_area = container_L * container_W
 
-    max_loops = 200
-
-    for container_no in range(1, max_loops + 1):
+    for container_no in range(1, 501):
         if not remaining:
             break
 
-        # Items too tall for this vehicle should immediately go to overflow.
-        height_ok = []
-        height_bad = []
-
-        for item in remaining:
-            item_h = float(item.get("H", 0))
-            if item_h <= container_H - assumptions.vehicle_height_clearance:
-                height_ok.append(item)
-            else:
-                height_bad.append(item)
-
         placed, overflow = pack_items_2d_maxrects(
-            height_ok,
-            container_L,
-            container_W,
-            assumptions.container_item_clearance,
+            remaining, container_L, container_W, assumptions.container_item_clearance, payload or None,
         )
 
-        # Payload check is warning-oriented.
-        # The current heuristic does not reshuffle by weight,
-        # but it reports overloaded containers.
+        if not placed:
+            for item in overflow:
+                item["unpacked_reason"] = "could not be placed"
+            unpacked.extend(overflow)
+            break
+
         load_weight = sum(float(x.get("weight", 0)) for x in placed)
-        payload_over = (
-            container_payload > 0
-            and load_weight > container_payload
-        )
-
-        floor_area = container_L * container_W
-        used_area = sum(
-            float(x["L"]) * float(x["W"])
-            for x in placed
-        )
-
-        util = (used_area / floor_area * 100.0) if floor_area > 0 else 0.0
+        used_area = sum(float(x["L"]) * float(x["W"]) for x in placed)
 
         loads.append(
             {
                 "vehicle_name": vehicle_name,
                 "container_no": container_no,
                 "placed": placed,
-                "overflow": overflow + height_bad,
-                "util": util,
+                "overflow": overflow,
+                "util": used_area / floor_area * 100.0 if floor_area > 0 else 0.0,
                 "weight": load_weight,
-                "payload_over": payload_over,
-                "payload_limit": container_payload,
+                "payload_over": payload > 0 and load_weight > payload,
+                "payload_limit": payload,
             }
         )
 
-        if not placed:
-            break
+        remaining = overflow
 
-        remaining = overflow + height_bad
+    return loads, unpacked
 
-    return loads
 
 # ==========================================================
 # 12. MAIN OPTIMIZATION / PLAN BUILDER
 # ==========================================================
 
-def build_package_contents_map(
-    pallets: List[PalletObject],
-    crates: List[Crate],
-) -> Dict[str, str]:
-    """
-    Maps every final piece ID to its assigned pallet/crate ID.
-    """
+def build_package_contents_map(pallets: List[PalletObject], crates: List[Crate]) -> Dict[str, str]:
     assignment: Dict[str, str] = {}
-
     for i, pallet in enumerate(pallets):
-        package_id = f"P{i + 1}"
         for p in pallet.pieces:
-            assignment[p.piece_id] = package_id
-
+            assignment[p.piece_id] = f"P{i + 1}"
     for i, crate in enumerate(crates):
-        package_id = f"C{i + 1}"
         for p in crate.pieces:
-            assignment[p.piece_id] = package_id
-
+            assignment[p.piece_id] = f"C{i + 1}"
     return assignment
 
 
 def build_manifest_df(
     pallets: List[PalletObject],
     crates: List[Crate],
-    vehicle_data: Dict[str, float],
+    lim: TransportLimits,
     assumptions: LogisticsAssumptions,
 ) -> pd.DataFrame:
-    """
-    Creates detailed manifest table for pallets and crates.
-    """
     rows: List[Dict[str, Any]] = []
 
-    max_h_ext = get_vehicle_external_crate_height_limit(
-        vehicle_data,
-        assumptions.vehicle_height_clearance,
-    )
-
     for i, pallet in enumerate(pallets):
-        contents = ", ".join([p.piece_id for p in pallet.pieces])
-
-        status = "OK"
+        status_items = []
         if pallet.weight > pallet.max_wgt:
-            status = "OVER PALLET WEIGHT"
+            status_items.append("OVER PALLET WEIGHT")
+        if pallet.H_ext > lim.usable_ext_h + 1e-6:
+            status_items.append("OVER VEHICLE/DOOR HEIGHT")
 
         rows.append(
             {
                 "Order": pallet.order,
                 "ID": f"P{i + 1}",
                 "Type": "PALLET",
+                "Transport Class": CLASS_DIS,
+                "Pieces": len(pallet.pieces),
                 "Weight": round(pallet.weight, 0),
-                "Dims": dim_text(pallet.L, pallet.W, pallet.H),
+                "Dims": dim_text(pallet.L, pallet.W, pallet.H_ext),
                 "L": round(pallet.L, 1),
                 "W": round(pallet.W, 1),
-                "H": round(pallet.H, 1),
-                "Status": status,
-                "Contents": contents,
+                "H": round(pallet.H_ext, 1),
+                "Status": "; ".join(status_items) or "OK",
+                "Handling": f"{pallet.name}; parts on edge",
+                "Contents": ", ".join(p.piece_id for p in pallet.pieces),
             }
         )
 
     for i, crate in enumerate(crates):
-        contents = ", ".join([p.piece_id for p in crate.pieces])
+        length, depth, height = crate.dims(lim)
 
         status_items: List[str] = []
-
-        if crate.weight > assumptions.max_crate_lbs:
-            status_items.append("OVER CRATE WEIGHT")
-
-        if crate.L_ext > assumptions.crate_max_len_ext:
-            status_items.append("OVER CRATE LENGTH")
-
-        if crate.W_ext > assumptions.crate_max_width_ext:
-            status_items.append("OVER CRATE WIDTH")
-
-        if crate.H_ext > max_h_ext:
-            status_items.append("OVER VEHICLE HEIGHT")
-
-        status = "; ".join(status_items) if status_items else "OK"
+        if crate.problem:
+            status_items.append(crate.problem)
+        status_items.extend(
+            v for v in crate.limit_violations(lim, assumptions) if v not in " ".join(status_items)
+        )
 
         rows.append(
             {
                 "Order": crate.order,
                 "ID": f"C{i + 1}",
-                "Type": "CRATE",
+                "Type": crate.package_type,
+                "Transport Class": crate.pclass,
+                "Pieces": len(crate.pieces),
                 "Weight": round(crate.weight, 0),
-                "Dims": dim_text(crate.L_ext, crate.W_ext, crate.H_ext),
-                "L": round(crate.L_ext, 1),
-                "W": round(crate.W_ext, 1),
-                "H": round(crate.H_ext, 1),
-                "Status": status,
-                "Contents": contents,
+                "Dims": dim_text(length, depth, height),
+                "L": round(length, 1),
+                "W": round(depth, 1),
+                "H": round(height, 1),
+                "Status": "; ".join(dict.fromkeys(status_items)) or "OK",
+                "Handling": HANDLING_NOTE_BY_CLASS.get(crate.pclass, ""),
+                "Contents": ", ".join(p.piece_id for p in crate.pieces),
             }
         )
 
     return pd.DataFrame(rows)
 
 
-def build_container_items_from_manifest(
-    manifest_df: pd.DataFrame,
-) -> List[Dict[str, Any]]:
-    """
-    Converts manifest rows into floor-packing objects.
-    """
+def build_container_items_from_manifest(manifest_df: pd.DataFrame) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
-
-    if manifest_df.empty:
+    if manifest_df is None or manifest_df.empty:
         return items
 
     for _, row in manifest_df.iterrows():
-        package_type = clean_str(row["Type"])
-        package_id = clean_str(row["ID"])
-
         items.append(
             {
-                "kind": package_type,
-                "package_id": package_id,
+                "kind": clean_str(row["Type"]),
+                "package_id": clean_str(row["ID"]),
+                "transport_class": clean_str(row["Transport Class"]),
                 "idx": len(items),
                 "L": float(row["L"]),
                 "W": float(row["W"]),
@@ -2035,61 +1998,36 @@ def build_container_items_from_manifest(
                 "status": clean_str(row["Status"]),
             }
         )
-
     return items
 
 
-def build_load_summary_df(
-    loads: List[Dict[str, Any]],
-) -> pd.DataFrame:
-    """
-    Creates one-row-per-container summary.
-    """
-    rows: List[Dict[str, Any]] = []
-
+def build_load_summary_df(loads: List[Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
     for load in loads:
         placed = load.get("placed", [])
-        overflow = load.get("overflow", [])
-
-        package_ids = [
-            clean_str(x.get("package_id"))
-            for x in placed
-        ]
-
         rows.append(
             {
                 "Container #": load["container_no"],
                 "Vehicle": load["vehicle_name"],
                 "Packages Loaded": len(placed),
-                "Packages Remaining After This Container": len(overflow),
+                "Packages Remaining After This Container": len(load.get("overflow", [])),
                 "Weight": round(float(load.get("weight", 0)), 0),
                 "Payload Limit": round(float(load.get("payload_limit", 0)), 0),
                 "Payload Status": "OVER PAYLOAD" if load.get("payload_over") else "OK",
                 "Floor Utilization %": round(float(load.get("util", 0)), 1),
-                "Packages": ", ".join(package_ids),
+                "Packages": ", ".join(clean_str(x.get("package_id")) for x in placed),
             }
         )
-
     return pd.DataFrame(rows)
 
 
-def assign_packages_to_decision_df(
-    decision_df: pd.DataFrame,
-    package_map: Dict[str, str],
-) -> pd.DataFrame:
-    """
-    Adds final package assignment to the piece decision table.
-    """
+def assign_packages_to_decision_df(decision_df: pd.DataFrame, package_map: Dict[str, str]) -> pd.DataFrame:
     if decision_df.empty:
         return decision_df
-
     out = decision_df.copy()
-
-    out["Assigned Package"] = out["Final Piece"].map(
-        lambda piece_id: package_map.get(piece_id, "UNASSIGNED")
-    )
-
+    out["Assigned Package"] = out["Final Piece"].map(lambda pid: package_map.get(pid, "UNASSIGNED"))
     return out
+
 
 def build_logistics_plan(
     master_df: pd.DataFrame,
@@ -2100,140 +2038,89 @@ def build_logistics_plan(
     assumptions: LogisticsAssumptions,
 ) -> Dict[str, Any]:
     """
-    Full end-to-end optimizer.
-
-    Steps:
-      1. Validate editable master table
-      2. Expand rows into final pieces
-      3. Keep orders separated if configured
-      4. Palletize disassembled pieces
-      5. Crate all remaining pieces
-      6. Pack packages into one or more containers
-      7. Return all result tables and visualization data
+    End-to-end optimizer:
+      1. normalize + validate the master table
+      2. expand rows into final pieces (splits, frame kits)
+      3. classify each piece by factory transport rules
+      4. palletize disassembled parts, crate/rack everything else
+      5. load packages into one or more vehicles
     """
+    master_df = normalize_master_df(master_df, assumptions)
     validation_issues = validate_master_dataframe(master_df)
 
-    blocking_errors = [
-        issue
-        for issue in validation_issues
-        if issue.severity == "ERROR"
-    ]
-
-    if blocking_errors:
+    if any(issue.severity == "ERROR" for issue in validation_issues):
         return {
             "ok": False,
             "errors": validation_issues_to_df(validation_issues),
             "message": "Fix validation errors before optimizing.",
         }
 
-    pieces, decision_df = build_pieces_from_master(
-        master_df,
-        vehicle_data,
-        assumptions,
-    )
-
-    pieces_by_group = group_pieces_for_packing(
-        pieces,
-        assumptions.no_mixing_orders,
-    )
+    lim = get_transport_limits(vehicle_data, assumptions)
+    pieces, decision_df = build_pieces_from_master(master_df, vehicle_data, assumptions)
 
     all_pallets: List[PalletObject] = []
     all_crates: List[Crate] = []
     packing_notes: List[Dict[str, Any]] = []
 
-    for group_name, group_pieces in pieces_by_group.items():
-        disassembled = [
-            p for p in group_pieces
-            if p.mode == "DISASSEMBLED"
-        ]
+    for group_name, group_pieces in group_pieces_for_packing(pieces, assumptions.no_mixing_orders).items():
+        disassembled = [p for p in group_pieces if p.transport_class(lim) == CLASS_DIS]
+        others = [p for p in group_pieces if p.transport_class(lim) != CLASS_DIS]
 
-        crate_candidates = [
-            p for p in group_pieces
-            if p.mode != "DISASSEMBLED"
-        ]
-
-        pallets, pallet_leftovers = palletize_disassembled_pieces(
-            order_name=group_name,
-            pieces=disassembled,
-            selected_pallet_names=selected_pallet_names,
-            pallet_catalog=pallet_catalog,
-            assumptions=assumptions,
+        pallets, leftovers = palletize_disassembled_pieces(
+            group_name, disassembled, selected_pallet_names, pallet_catalog, lim, assumptions,
         )
-
         all_pallets.extend(pallets)
 
-        crate_feed = crate_candidates + pallet_leftovers
+        for pallet in pallets:
+            for p in pallet.pieces:
+                packing_notes.append({"Piece": p.piece_id, "Class": CLASS_DIS, "Assigned": "Pallet",
+                                      "Reason": pallet.name, "Group": group_name})
 
-        crates, crate_notes = crate_pieces(
-            order_name=group_name,
-            pieces=crate_feed,
-            vehicle_data=vehicle_data,
-            assumptions=assumptions,
-        )
-
+        crates, crate_notes = crate_pieces(group_name, others + leftovers, lim, assumptions)
         all_crates.extend(crates)
 
         for note in crate_notes:
             note["Group"] = group_name
             packing_notes.append(note)
 
-    package_map = build_package_contents_map(
-        all_pallets,
-        all_crates,
+    package_map = build_package_contents_map(all_pallets, all_crates)
+    decision_df = assign_packages_to_decision_df(decision_df, package_map)
+    manifest_df = build_manifest_df(all_pallets, all_crates, lim, assumptions)
+
+    loads, unpacked = pack_across_multiple_containers(
+        build_container_items_from_manifest(manifest_df), vehicle_name, vehicle_data, assumptions,
     )
 
-    decision_df = assign_packages_to_decision_df(
-        decision_df,
-        package_map,
-    )
-
-    manifest_df = build_manifest_df(
-        all_pallets,
-        all_crates,
-        vehicle_data,
-        assumptions,
-    )
-
-    items = build_container_items_from_manifest(manifest_df)
-
-    loads = pack_across_multiple_containers(
-        items=items,
-        vehicle_name=vehicle_name,
-        vehicle_data=vehicle_data,
-        assumptions=assumptions,
-    )
-
-    load_summary_df = build_load_summary_df(loads)
-
-    order_color_map = build_order_color_map(
-        list(master_df["Order"].astype(str).unique())
-    )
-
-    packing_notes_df = pd.DataFrame(packing_notes)
-
-    final_overflow = loads[-1]["overflow"] if loads else []
-
-    result = {
+    return {
         "ok": True,
         "message": "Optimization complete.",
         "vehicle_name": vehicle_name,
         "vehicle_data": vehicle_data,
         "assumptions": assumptions,
+        "limits": lim,
         "pieces": pieces,
         "pallets": all_pallets,
         "crates": all_crates,
         "loads": loads,
-        "detail_df": manifest_df,
         "manifest_df": manifest_df,
         "decision_df": decision_df,
-        "packing_notes_df": packing_notes_df,
-        "load_summary_df": load_summary_df,
-        "order_color_map": order_color_map,
-        "final_overflow": final_overflow,
+        "packing_notes_df": pd.DataFrame(packing_notes),
+        "load_summary_df": build_load_summary_df(loads),
+        "order_color_map": build_order_color_map(list(master_df["Order"].astype(str).unique())),
+        "final_overflow": unpacked,
         "validation_issues_df": validation_issues_to_df(validation_issues),
     }
 
-    return result
+
+def plan_class_counts(plan: Dict[str, Any]) -> Dict[str, int]:
+    """Number of final pieces per transport class."""
+    lim: TransportLimits = plan["limits"]
+    counts: Dict[str, int] = {}
+    for p in plan["pieces"]:
+        cls = p.transport_class(lim)
+        counts[cls] = counts.get(cls, 0) + 1
+    return counts
+
 
 # ==========================================================
 # 13. SCENARIO COMPARISON
@@ -2246,116 +2133,112 @@ def create_scenario_master_df(
     assumptions: LogisticsAssumptions,
 ) -> pd.DataFrame:
     """
-    Creates a copy of the master table with simple strategy changes.
+    Applies a handling strategy to rows that do not ship on a standard
+    pallet as currently set.
 
-    Scenario options:
-      - Current Settings
-      - Auto Slant Tall Units
-      - Disassemble Oversized Units
-      - Split Oversized Units 2x1
+      Current Settings                      : unchanged
+      Slant Instead of Low-Floor / Oversize : SLANT for low-floor/oversize
+                                              rows up to the slant limit
+                                              (keeps glass in the unit)
+      Disassemble Oversized Units           : DISASSEMBLED (+ split rows
+                                              if the part is still too tall)
+      Split Oversized Units                 : split rows/cols until parts
+                                              fit standard height and crate
+                                              weight
     """
-    df = base_df.copy()
-
-    if df.empty:
+    df = normalize_master_df(base_df, assumptions)
+    if df.empty or scenario_name == SCENARIO_CURRENT:
         return df
 
-    max_h_int = get_vehicle_internal_crate_height_limit(
-        vehicle_data,
-        assumptions.vehicle_height_clearance,
-    )
-
-    if scenario_name == "Current Settings":
-        return df
+    lim = get_transport_limits(vehicle_data, assumptions)
 
     for idx, row in df.iterrows():
-        width = float(row["W"])
-        height = float(row["H"])
-        lbs = float(row["Lbs"])
+        piece = row_to_piece(row)
+        if piece is None:
+            continue
 
-        too_tall = height > max_h_int and width > max_h_int
-        too_heavy = lbs > assumptions.max_crate_lbs
-        needs_handling = too_tall or too_heavy
+        sr = safe_int(row.get("SR"), 1) or 1
+        sc = safe_int(row.get("SC"), 1) or 1
+        if sr * sc > 1:
+            continue  # user already decided how to split this unit
 
-        if scenario_name == "Auto Slant Tall Units":
-            if height > max_h_int:
+        cls = piece.transport_class(lim)
+        heavy = piece.lbs > assumptions.max_crate_lbs
+        needs_split_rows = max(1, math.ceil(piece.h / lim.std_max_v))
+
+        if scenario_name == SCENARIO_SLANT:
+            if cls in (CLASS_LOW, CLASS_OVERSIZE) and min(piece.w, piece.h) <= lim.slant_max_v:
                 df.at[idx, "Mode"] = "SLANT"
 
-        elif scenario_name == "Disassemble Oversized Units":
-            if needs_handling:
+        elif scenario_name == SCENARIO_DISASSEMBLE:
+            if cls in (CLASS_LOW, CLASS_OVERSIZE) or heavy:
                 df.at[idx, "Mode"] = "DISASSEMBLED"
+                if min(piece.w, piece.h) > lim.std_max_v:
+                    df.at[idx, "SR"] = needs_split_rows
 
-        elif scenario_name == "Split Oversized Units 2x1":
-            if needs_handling:
-                df.at[idx, "SR"] = 2
-                df.at[idx, "SC"] = 1
+        elif scenario_name == SCENARIO_SPLIT:
+            if cls in (CLASS_LOW, CLASS_OVERSIZE) or heavy:
                 df.at[idx, "Mode"] = "WHOLE"
+                df.at[idx, "Orient"] = "UPRIGHT"
+                df.at[idx, "SR"] = needs_split_rows if cls in (CLASS_LOW, CLASS_OVERSIZE) else 1
+                if heavy:
+                    df.at[idx, "SC"] = max(1, math.ceil(piece.lbs / assumptions.max_crate_lbs))
 
     return df
 
 
-def summarize_plan_for_scenario(
-    scenario_name: str,
-    vehicle_name: str,
-    plan: Dict[str, Any],
-) -> Dict[str, Any]:
+def summarize_plan_for_scenario(scenario_name: str, vehicle_name: str, plan: Dict[str, Any]) -> Dict[str, Any]:
     if not plan.get("ok"):
         return {
             "Scenario": scenario_name,
             "Vehicle": vehicle_name,
             "Status": "ERROR",
-            "Containers": "",
-            "Crates": "",
-            "Pallets": "",
-            "Total Weight": "",
-            "Avg Floor Util %": "",
-            "Unpacked Items": "",
+            "Containers": None,
+            "Crates/Racks": None,
+            "Pallets": None,
+            "Low-Floor Pieces (no glass)": None,
+            "Slant Pieces": None,
+            "Total Weight": None,
+            "Avg Floor Util %": None,
+            "Unpacked Items": None,
             "Warnings": plan.get("message", "Could not optimize"),
         }
 
     loads = plan["loads"]
-    detail_df = plan["detail_df"]
-    final_overflow = plan["final_overflow"]
+    manifest_df = plan["manifest_df"]
+    unpacked = plan["final_overflow"]
+    counts = plan_class_counts(plan)
 
-    total_weight = 0.0
-    if not detail_df.empty:
-        total_weight = float(detail_df["Weight"].astype(float).sum())
+    total_weight = float(manifest_df["Weight"].astype(float).sum()) if not manifest_df.empty else 0.0
+    avg_util = sum(float(ld["util"]) for ld in loads) / len(loads) if loads else 0.0
+    bad_packages = int((manifest_df["Status"].astype(str) != "OK").sum()) if not manifest_df.empty else 0
 
-    avg_util = 0.0
-    if loads:
-        avg_util = sum(float(ld["util"]) for ld in loads) / len(loads)
+    warnings = []
+    if bad_packages:
+        warnings.append(f"{bad_packages} package issue(s)")
+    if unpacked:
+        warnings.append(f"{len(unpacked)} unpacked package(s)")
+    if counts.get(CLASS_LOW):
+        warnings.append(f"{counts[CLASS_LOW]} low-floor piece(s) ship without glass")
 
-    over_payload_count = sum(
-        1 for ld in loads
-        if ld.get("payload_over")
-    )
-
-    bad_manifest_count = 0
-    if not detail_df.empty and "Status" in detail_df.columns:
-        bad_manifest_count = len(
-            detail_df[detail_df["Status"].astype(str) != "OK"]
-        )
-
-    warnings: List[str] = []
-
-    if over_payload_count:
-        warnings.append(f"{over_payload_count} container(s) over payload")
-
-    if bad_manifest_count:
-        warnings.append(f"{bad_manifest_count} package issue(s)")
-
-    if final_overflow:
-        warnings.append(f"{len(final_overflow)} unpacked item(s)")
+    status = "OK"
+    if bad_packages or unpacked:
+        status = "REVIEW"
+    elif counts.get(CLASS_LOW):
+        status = "OK - RESTRICTIONS"
 
     return {
         "Scenario": scenario_name,
         "Vehicle": vehicle_name,
-        "Status": "OK" if not warnings else "REVIEW",
+        "Status": status,
         "Containers": len(loads),
-        "Crates": len(plan["crates"]),
+        "Crates/Racks": len(plan["crates"]),
         "Pallets": len(plan["pallets"]),
+        "Low-Floor Pieces (no glass)": counts.get(CLASS_LOW, 0),
+        "Slant Pieces": counts.get(CLASS_SLANT, 0),
         "Total Weight": round(total_weight, 0),
         "Avg Floor Util %": round(avg_util, 1),
-        "Unpacked Items": len(final_overflow),
+        "Unpacked Items": len(unpacked),
         "Warnings": "; ".join(warnings) if warnings else "None",
     }
 
@@ -2369,44 +2252,25 @@ def run_scenario_comparison(
     assumptions: LogisticsAssumptions,
     selected_strategy_names: List[str],
 ) -> pd.DataFrame:
-    """
-    Runs multiple strategy + vehicle combinations and returns summary.
-    """
-    rows: List[Dict[str, Any]] = []
-
+    rows = []
     for vehicle_name in selected_vehicle_names:
         vehicle_data = vehicle_catalog[vehicle_name]
-
         for strategy_name in selected_strategy_names:
-            scenario_df = create_scenario_master_df(
-                base_df=master_df,
-                scenario_name=strategy_name,
-                vehicle_data=vehicle_data,
-                assumptions=assumptions,
-            )
-
+            scenario_df = create_scenario_master_df(master_df, strategy_name, vehicle_data, assumptions)
             plan = build_logistics_plan(
-                master_df=scenario_df,
-                vehicle_name=vehicle_name,
-                vehicle_data=vehicle_data,
-                selected_pallet_names=selected_pallet_names,
-                pallet_catalog=pallet_catalog,
-                assumptions=assumptions,
+                scenario_df, vehicle_name, vehicle_data, selected_pallet_names, pallet_catalog, assumptions,
             )
-
-            rows.append(
-                summarize_plan_for_scenario(
-                    scenario_name=strategy_name,
-                    vehicle_name=vehicle_name,
-                    plan=plan,
-                )
-            )
-
+            rows.append(summarize_plan_for_scenario(strategy_name, vehicle_name, plan))
     return pd.DataFrame(rows)
+
 
 # ==========================================================
 # 14. VISUALIZATION HELPERS
 # ==========================================================
+
+def package_fill_alpha(kind: str) -> float:
+    return 0.55 if kind == "PALLET" else 0.35
+
 
 def build_2d_plan(
     placed_items: List[Dict[str, Any]],
@@ -2415,48 +2279,34 @@ def build_2d_plan(
     order_color_map: Dict[str, str],
     title_text: str = "",
 ) -> go.Figure:
-    """
-    Interactive 2D floor plan using Plotly.
-    """
     fig = go.Figure()
 
     fig.add_shape(
-        type="rect",
-        x0=0,
-        y0=0,
-        x1=container_L,
-        y1=container_W,
-        line=dict(color="black", width=4),
-        fillcolor="rgba(240,240,240,0.5)",
+        type="rect", x0=0, y0=0, x1=container_L, y1=container_W,
+        line=dict(color="black", width=4), fillcolor="rgba(240,240,240,0.5)",
     )
 
     for item in placed_items:
         order = clean_str(item.get("order"))
         base_hex = order_color_map.get(order, "#888888")
 
-        fill_alpha = 0.55 if item["kind"] == "PALLET" else 0.35
-        fill_color = hex_to_rgba(base_hex, fill_alpha)
-
         fig.add_shape(
             type="rect",
-            x0=item["x"],
-            y0=item["y"],
-            x1=item["x"] + item["L"],
-            y1=item["y"] + item["W"],
-            fillcolor=fill_color,
+            x0=item["x"], y0=item["y"],
+            x1=item["x"] + item["L"], y1=item["y"] + item["W"],
+            fillcolor=hex_to_rgba(base_hex, package_fill_alpha(item["kind"])),
             line=dict(color="black", width=2),
         )
 
         label = clean_str(item.get("package_id"))
-        if order:
-            label = f"{label}<br>{order}"
-
         hover_text = (
-            f"Package: {clean_str(item.get('package_id'))}<br>"
+            f"Package: {label}<br>"
             f"Type: {clean_str(item.get('kind'))}<br>"
+            f"Class: {clean_str(item.get('transport_class'))}<br>"
             f"Order: {order}<br>"
             f"Dims: {dim_text(float(item['L']), float(item['W']), float(item.get('H', 0)))}<br>"
-            f"Weight: {pounds_text(float(item.get('weight', 0)))}"
+            f"Weight: {pounds_text(float(item.get('weight', 0)))}<br>"
+            f"Status: {clean_str(item.get('status'))}"
         )
 
         fig.add_trace(
@@ -2465,7 +2315,7 @@ def build_2d_plan(
                 y=[item["y"] + item["W"] / 2],
                 mode="text",
                 text=[f"<b>{label}</b>"],
-                textfont=dict(color="white", size=12),
+                textfont=dict(color="black", size=11),
                 hovertext=[hover_text],
                 hoverinfo="text",
                 showlegend=False,
@@ -2474,20 +2324,13 @@ def build_2d_plan(
 
     fig.update_layout(
         title=title_text,
-        xaxis=dict(
-            range=[-10, container_L + 10],
-            title="Length (in)",
-        ),
-        yaxis=dict(
-            range=[-10, container_W + 10],
-            title="Width (in)",
-            scaleanchor="x",
-        ),
+        xaxis=dict(range=[-10, container_L + 10], title="Length (in)"),
+        yaxis=dict(range=[-10, container_W + 10], title="Width (in)", scaleanchor="x"),
         height=520,
         margin=dict(l=20, r=20, t=50, b=20),
     )
-
     return fig
+
 
 def render_mpl_2d_plan(
     placed_items: List[Dict[str, Any]],
@@ -2496,53 +2339,27 @@ def render_mpl_2d_plan(
     order_color_map: Dict[str, str],
     title_text: str = "",
 ) -> BytesIO:
-    """
-    Matplotlib fallback renderer for PDF export.
-    Useful when Plotly/Kaleido image export is unavailable.
-    """
+    """Matplotlib renderer for the PDF (no Kaleido/Chrome dependency)."""
     fig = Figure(figsize=(10, 4))
     ax = fig.add_subplot(111)
 
     ax.add_patch(
-        patches.Rectangle(
-            (0, 0),
-            container_L,
-            container_W,
-            linewidth=2,
-            edgecolor="black",
-            facecolor="#f9f9f9",
-        )
+        patches.Rectangle((0, 0), container_L, container_W, linewidth=2, edgecolor="black", facecolor="#f9f9f9")
     )
 
     for item in placed_items:
-        order = clean_str(item.get("order"))
-        base_hex = order_color_map.get(order, "#888888")
-        alpha = 0.55 if item["kind"] == "PALLET" else 0.35
-
-        rect = patches.Rectangle(
-            (item["x"], item["y"]),
-            item["L"],
-            item["W"],
-            linewidth=1,
-            edgecolor="black",
-            facecolor=base_hex,
-            alpha=alpha,
+        base_hex = order_color_map.get(clean_str(item.get("order")), "#888888")
+        ax.add_patch(
+            patches.Rectangle(
+                (item["x"], item["y"]), item["L"], item["W"],
+                linewidth=1, edgecolor="black", facecolor=base_hex,
+                alpha=package_fill_alpha(item["kind"]),
+            )
         )
-        ax.add_patch(rect)
-
-        center_x = item["x"] + item["L"] / 2
-        center_y = item["y"] + item["W"] / 2
-        label = clean_str(item.get("package_id"))
-
         ax.text(
-            center_x,
-            center_y,
-            label,
-            ha="center",
-            va="center",
-            color="white",
-            fontsize=8,
-            fontweight="bold",
+            item["x"] + item["L"] / 2, item["y"] + item["W"] / 2,
+            clean_str(item.get("package_id")),
+            ha="center", va="center", color="black", fontsize=7, fontweight="bold",
         )
 
     ax.set_xlim(-10, container_L + 10)
@@ -2552,14 +2369,12 @@ def render_mpl_2d_plan(
     ax.set_xlabel("Length (in)")
     ax.set_ylabel("Width (in)")
 
-    canvas = FigureCanvasAgg(fig)
     buf = BytesIO()
-
     fig.tight_layout()
-    canvas.print_png(buf)
+    FigureCanvasAgg(fig).print_png(buf)
     buf.seek(0)
-
     return buf
+
 
 def add_3d_prism(
     fig: go.Figure,
@@ -2572,52 +2387,33 @@ def add_3d_prism(
     color: str,
     opacity: float = 0.5,
     name: str = "Box",
-    slant_extra: float = 0.0,
-    target_h: float = 0.0,
+    top_dx: float = 0.0,
+    top_dy: float = 0.0,
     hover_text: str = "",
 ) -> None:
     """
-    Adds a rectangular or slanted prism to a Plotly 3D figure.
+    Adds a box to a Plotly 3D figure. top_dx / top_dy shift the top face,
+    which draws a leaning (slanted) unit as a sheared prism.
     """
-    if slant_extra > 0:
-        v = [
-            (x, y, z),
-            (x + length, y, z),
-            (x + length, y + width, z),
-            (x, y + width, z),
-            (x + slant_extra, y, z + target_h),
-            (x + length + slant_extra, y, z + target_h),
-            (x + length + slant_extra, y + width, z + target_h),
-            (x + slant_extra, y + width, z + target_h),
-        ]
-    else:
-        v = [
-            (x, y, z),
-            (x + length, y, z),
-            (x + length, y + width, z),
-            (x, y + width, z),
-            (x, y, z + height),
-            (x + length, y, z + height),
-            (x + length, y + width, z + height),
-            (x, y + width, z + height),
-        ]
-
-    xs = [point[0] for point in v]
-    ys = [point[1] for point in v]
-    zs = [point[2] for point in v]
-
-    i = [7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 2]
-    j = [3, 4, 1, 2, 5, 6, 5, 2, 0, 1, 6, 3]
-    k = [0, 7, 2, 3, 6, 7, 1, 1, 5, 5, 7, 6]
+    v = [
+        (x, y, z),
+        (x + length, y, z),
+        (x + length, y + width, z),
+        (x, y + width, z),
+        (x + top_dx, y + top_dy, z + height),
+        (x + length + top_dx, y + top_dy, z + height),
+        (x + length + top_dx, y + width + top_dy, z + height),
+        (x + top_dx, y + width + top_dy, z + height),
+    ]
 
     fig.add_trace(
         go.Mesh3d(
-            x=xs,
-            y=ys,
-            z=zs,
-            i=i,
-            j=j,
-            k=k,
+            x=[p[0] for p in v],
+            y=[p[1] for p in v],
+            z=[p[2] for p in v],
+            i=[7, 0, 0, 0, 4, 4, 6, 6, 4, 0, 3, 2],
+            j=[3, 4, 1, 2, 5, 6, 5, 2, 0, 1, 6, 3],
+            k=[0, 7, 2, 3, 6, 7, 1, 1, 5, 5, 7, 6],
             opacity=opacity,
             color=color,
             name=name,
@@ -2627,6 +2423,7 @@ def add_3d_prism(
         )
     )
 
+
 def build_3d_plan(
     load: Dict[str, Any],
     result: Dict[str, Any],
@@ -2634,171 +2431,128 @@ def build_3d_plan(
     order_color_map: Dict[str, str],
 ) -> go.Figure:
     """
-    Builds 3D view of one selected container load.
-    """
-    container_L = float(vehicle_data["L"])
-    container_W = float(vehicle_data["W"])
-    container_H = float(vehicle_data["H"])
+    3D view of one vehicle load.
 
+    Inside each crate/rack, units run along the package length and are
+    stacked along the package depth. If the floor packer rotated the
+    package, the axes are swapped so the units are drawn correctly.
+    Slanted units lean along the depth axis.
+    """
+    lim: TransportLimits = result["limits"]
     fig = go.Figure()
 
     add_3d_prism(
-        fig,
-        0,
-        0,
-        0,
-        container_L,
-        container_W,
-        container_H,
-        "gray",
-        0.05,
-        "Vehicle Shell",
-        hover_text="Vehicle Shell",
+        fig, 0, 0, 0,
+        float(vehicle_data["L"]), float(vehicle_data["W"]), float(vehicle_data["H"]),
+        "gray", 0.05, "Vehicle Shell", hover_text="Vehicle Shell",
     )
-
-    pallets: List[PalletObject] = result["pallets"]
-    crates: List[Crate] = result["crates"]
 
     package_lookup: Dict[str, Any] = {}
-
-    for i, pallet in enumerate(pallets):
+    for i, pallet in enumerate(result["pallets"]):
         package_lookup[f"P{i + 1}"] = pallet
-
-    for i, crate in enumerate(crates):
+    for i, crate in enumerate(result["crates"]):
         package_lookup[f"C{i + 1}"] = crate
-
-    max_h_int = get_vehicle_internal_crate_height_limit(
-        vehicle_data,
-        result["assumptions"].vehicle_height_clearance,
-    )
 
     for item in load.get("placed", []):
         order_name = clean_str(item.get("order"))
         package_id = clean_str(item.get("package_id"))
         base_hex = order_color_map.get(order_name, "#888888")
         obj = package_lookup.get(package_id)
+        rotated = bool(item.get("rotated"))
 
-        if item["kind"] == "PALLET":
-            add_3d_prism(
-                fig,
-                item["x"],
-                item["y"],
-                0,
-                item["L"],
-                item["W"],
-                item["H"],
-                base_hex,
-                0.35,
-                package_id,
-                hover_text=f"{package_id}: Pallet ({order_name})",
+        add_3d_prism(
+            fig, item["x"], item["y"], 0, item["L"], item["W"], item["H"],
+            base_hex, 0.35 if item["kind"] == "PALLET" else 0.18, package_id,
+            hover_text=f"{package_id}: {item['kind']} ({order_name})",
+        )
+
+        # Duck-typed: stored results hold objects from an earlier script run,
+        # so isinstance() against the re-defined class would be False.
+        if obj is None or not hasattr(obj, "pclass"):
+            continue
+
+        cos_t, _ = obj.slant_geometry(lim)
+        is_slant = obj.pclass == CLASS_SLANT
+        z0 = lim.low_overhead / 2 if obj.pclass == CLASS_LOW else lim.std_overhead / 2
+
+        # s = position along the stack (package depth axis)
+        s = CRATE_BASE_DEPTH / 2
+
+        for p in obj.pieces:
+            base = p.base(lim)
+            thick = p.d
+            vertical = p.vertical(lim)
+            shown_h = vertical * cos_t if is_slant else vertical
+            lean = vertical * math.sqrt(max(0.0, 1 - cos_t ** 2)) if is_slant else 0.0
+            foot = thick / cos_t if is_slant else thick
+
+            hover = (
+                f"{p.piece_id}<br>Mode: {p.mode}<br>"
+                f"Class: {p.transport_class(lim)}<br>"
+                f"Dims: {dim_text(p.w, p.h, p.d)}<br>"
+                f"Weight: {pounds_text(p.lbs)}"
             )
 
-        elif item["kind"] == "CRATE":
-            add_3d_prism(
-                fig,
-                item["x"],
-                item["y"],
-                0,
-                item["L"],
-                item["W"],
-                item["H"],
-                base_hex,
-                0.22,
-                package_id,
-                hover_text=f"{package_id}: Crate ({order_name})",
-            )
+            if not rotated:
+                # length along x, stack along y
+                add_3d_prism(
+                    fig, item["x"] + CRATE_SIDE_CLEAR, item["y"] + s, z0,
+                    base, foot, shown_h, "royalblue", 0.8, p.piece_id,
+                    top_dx=0.0, top_dy=lean, hover_text=hover,
+                )
+            else:
+                # length along y, stack along x
+                add_3d_prism(
+                    fig, item["x"] + s, item["y"] + CRATE_SIDE_CLEAR, z0,
+                    foot, base, shown_h, "royalblue", 0.8, p.piece_id,
+                    top_dx=lean, top_dy=0.0, hover_text=hover,
+                )
 
-            if isinstance(obj, Crate):
-                current_y = item["y"] + CRATE_SIDE_CLEAR
+            s += (thick + UNIT_SPACER) / cos_t if is_slant else thick + UNIT_SPACER
 
-                for p in obj.pieces:
-                    vertical = p.oriented_vertical(max_h_int)
-                    slant_extra = 0.0
-
-                    if p.mode == "SLANT" and vertical > max_h_int:
-                        slant_extra = math.sqrt(
-                            max(0.0, vertical ** 2 - max_h_int ** 2)
-                        )
-
-                    shown_h = max_h_int if slant_extra > 0 else vertical
-
-                    add_3d_prism(
-                        fig,
-                        item["x"] + CRATE_SIDE_CLEAR,
-                        current_y,
-                        CRATE_SIDE_CLEAR,
-                        p.oriented_base(max_h_int),
-                        p.d,
-                        shown_h,
-                        "royalblue",
-                        0.8,
-                        p.piece_id,
-                        slant_extra,
-                        shown_h,
-                        hover_text=(
-                            f"{p.piece_id}<br>"
-                            f"Mode: {p.mode}<br>"
-                            f"Dims: {dim_text(p.w, p.h, p.d)}<br>"
-                            f"Weight: {pounds_text(p.lbs)}"
-                        ),
-                    )
-
-                    current_y += p.d + UNIT_SPACER
-
-    fig.update_layout(
-        scene=dict(aspectmode="data"),
-        height=620,
-        margin=dict(l=0, r=0, b=0, t=0),
-    )
-
+    fig.update_layout(scene=dict(aspectmode="data"), height=620, margin=dict(l=0, r=0, b=0, t=0))
     return fig
+
 
 # ==========================================================
 # 15. PDF EXPORT
 # ==========================================================
 
 def paragraph_safe(value: Any) -> str:
-    """
-    Basic escaping for ReportLab Paragraph text.
-    """
     text = clean_str(value)
-    text = text.replace("&", "&amp;")
-    text = text.replace("<", "&lt;")
-    text = text.replace(">", "&gt;")
-    return text
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def df_to_reportlab_table(
     df: pd.DataFrame,
     max_rows: int = 60,
     font_size: int = 7,
+    wrap_cols: Optional[List[str]] = None,
 ) -> Table:
-    """
-    Converts a DataFrame to a ReportLab table.
-    Keeps the PDF from exploding on very large content.
-    """
+    """DataFrame -> ReportLab table. Long text columns wrap via Paragraphs."""
+    wrap_cols = wrap_cols or []
+    cell_style = ParagraphStyle("Cell", fontSize=font_size, leading=font_size + 2)
+
     if df is None or df.empty:
-        data = [["No data"]]
+        data: List[List[Any]] = [["No data"]]
     else:
         shown = df.head(max_rows).copy()
+        header = [str(c) for c in shown.columns]
+        data = [header]
 
-        for col in shown.columns:
-            shown[col] = shown[col].astype(str).map(
-                lambda x: x[:250] + "..." if len(x) > 250 else x
-            )
-
-        data = [shown.columns.tolist()] + shown.values.tolist()
+        for _, row in shown.iterrows():
+            out_row: List[Any] = []
+            for col in shown.columns:
+                text = clean_str(row[col])
+                if len(text) > 400:
+                    text = text[:400] + "..."
+                out_row.append(Paragraph(paragraph_safe(text), cell_style) if col in wrap_cols else text)
+            data.append(out_row)
 
         if len(df) > max_rows:
-            data.append(
-                [
-                    f"... {len(df) - max_rows} additional row(s) not shown in PDF"
-                ]
-                + [""] * (len(shown.columns) - 1)
-            )
+            data.append([f"... {len(df) - max_rows} additional row(s) not shown in PDF"] + [""] * (len(header) - 1))
 
     table = Table(data, repeatRows=1)
-
     table.setStyle(
         TableStyle(
             [
@@ -2811,7 +2565,6 @@ def df_to_reportlab_table(
             ]
         )
     )
-
     return table
 
 
@@ -2820,7 +2573,9 @@ def build_pdf_meta_table(
     vehicle_name: str,
     vehicle_data: Dict[str, float],
     assumptions: LogisticsAssumptions,
+    lim: TransportLimits,
 ) -> Table:
+    door = safe_float(vehicle_data.get("door_H"), None)
     data = [
         ["Project", project.project_name],
         ["Customer", project.customer],
@@ -2835,22 +2590,26 @@ def build_pdf_meta_table(
         ["Generated", now_stamp()],
         [
             "Vehicle",
-            (
-                f"{vehicle_name} — "
-                f'{vehicle_data["L"]:.0f}"L x '
-                f'{vehicle_data["W"]:.0f}"W x '
-                f'{vehicle_data["H"]:.0f}"H'
-            ),
+            f'{vehicle_name} - {vehicle_data["L"]:.0f}"L x {vehicle_data["W"]:.0f}"W x {vehicle_data["H"]:.0f}"H'
+            + (f', door {door:.1f}"' if door else ""),
         ],
-        ["Vehicle Payload", pounds_text(float(vehicle_data.get("max_lbs", 0)))],
+        ["Vehicle Payload", pounds_text(float(vehicle_data.get("max_lbs", 0) or 0))],
+        ["Max Package Height", inches_mm_text(lim.usable_ext_h)],
+        [
+            "Factory Transport Rules",
+            f"Standard pallet up to {inches_mm_text(lim.std_max_v)}; "
+            f"low-floor (no glass) up to {inches_mm_text(lim.low_floor_max_v)}; "
+            f"slant rack up to {inches_mm_text(lim.slant_max_v)} leaned to {inches_text(lim.slant_target_v)}",
+        ],
         ["Max Crate Weight", pounds_text(assumptions.max_crate_lbs)],
         ["Max Pallet Weight", pounds_text(assumptions.max_pallet_lbs)],
-        ["Height Clearance", inches_text(assumptions.vehicle_height_clearance)],
         ["Planning Note", assumptions.planning_warning],
     ]
 
-    table = Table(data, colWidths=[130, 570])
+    cell_style = ParagraphStyle("Meta", fontSize=8, leading=10)
+    data = [[k, Paragraph(paragraph_safe(v), cell_style)] for k, v in data]
 
+    table = Table(data, colWidths=[130, 600])
     table.setStyle(
         TableStyle(
             [
@@ -2861,264 +2620,110 @@ def build_pdf_meta_table(
             ]
         )
     )
-
     return table
 
-def generate_pdf_report(
-    project: ProjectMeta,
-    result: Dict[str, Any],
-) -> bytes:
-    """
-    Generates a PDF logistics manifest.
 
-    Includes:
-      - cover/project metadata
-      - assumptions/warning
-      - container summary
-      - package manifest
-      - decision table
-      - 2D plan for each container
-    """
+def generate_pdf_report(project: ProjectMeta, result: Dict[str, Any]) -> bytes:
     buffer = BytesIO()
-
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=landscape(letter),
-        rightMargin=24,
-        leftMargin=24,
-        topMargin=24,
-        bottomMargin=24,
+        buffer, pagesize=landscape(letter),
+        rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=24,
     )
 
     styles = getSampleStyleSheet()
-
-    small_style = ParagraphStyle(
-        "Small",
-        parent=styles["Normal"],
-        fontSize=7,
-        leading=9,
-    )
+    small_style = ParagraphStyle("Small", parent=styles["Normal"], fontSize=7, leading=9)
 
     story: List[Any] = []
-
     vehicle_name = result["vehicle_name"]
     vehicle_data = result["vehicle_data"]
     assumptions: LogisticsAssumptions = result["assumptions"]
-
+    lim: TransportLimits = result["limits"]
     manifest_df = result["manifest_df"]
-    load_summary_df = result["load_summary_df"]
     decision_df = result["decision_df"]
-    order_color_map = result["order_color_map"]
     loads = result["loads"]
 
-    story.append(
-        Paragraph(
-            f"Logistics Manifest: {paragraph_safe(project.display_name())}",
-            styles["Title"],
-        )
-    )
+    story.append(Paragraph(f"Logistics Manifest: {paragraph_safe(project.display_name())}", styles["Title"]))
     story.append(Spacer(1, 10))
-
-    story.append(
-        Paragraph(
-            paragraph_safe(assumptions.planning_warning),
-            small_style,
-        )
-    )
+    story.append(Paragraph(paragraph_safe(assumptions.planning_warning), small_style))
     story.append(Spacer(1, 10))
-
-    story.append(
-        build_pdf_meta_table(
-            project,
-            vehicle_name,
-            vehicle_data,
-            assumptions,
-        )
-    )
-
+    story.append(build_pdf_meta_table(project, vehicle_name, vehicle_data, assumptions, lim))
     story.append(Spacer(1, 14))
 
     story.append(Paragraph("Container Summary", styles["Heading2"]))
     story.append(Spacer(1, 6))
-    story.append(df_to_reportlab_table(load_summary_df, max_rows=80, font_size=7))
-
+    story.append(df_to_reportlab_table(result["load_summary_df"], max_rows=80, font_size=7, wrap_cols=["Packages"]))
     story.append(Spacer(1, 14))
 
     story.append(Paragraph("Package Manifest", styles["Heading2"]))
     story.append(Spacer(1, 6))
-
-    manifest_pdf_cols = [
-        col
-        for col in [
-            "Order",
-            "ID",
-            "Type",
-            "Weight",
-            "Dims",
-            "Status",
-            "Contents",
-        ]
-        if col in manifest_df.columns
-    ]
-
+    manifest_cols = [c for c in ["Order", "ID", "Type", "Weight", "Dims", "Status", "Handling", "Contents"]
+                     if c in manifest_df.columns]
     story.append(
         df_to_reportlab_table(
-            manifest_df[manifest_pdf_cols] if not manifest_df.empty else manifest_df,
-            max_rows=80,
-            font_size=6,
+            manifest_df[manifest_cols] if not manifest_df.empty else manifest_df,
+            max_rows=80, font_size=6, wrap_cols=["Status", "Handling", "Contents"],
         )
     )
-
     story.append(PageBreak())
 
     story.append(Paragraph("Packing Decisions", styles["Heading2"]))
     story.append(Spacer(1, 6))
-
-    decision_pdf_cols = [
-        col
-        for col in [
-            "Order",
-            "Original Unit",
-            "Final Piece",
-            "Mode",
-            "Orientation",
-            "W",
-            "H",
-            "Depth",
-            "Lbs",
-            "Assigned Package",
-        ]
-        if col in decision_df.columns
-    ]
-
+    decision_cols = [c for c in ["Order", "Final Piece", "Mode", "Orientation", "Transport Class", "Glass",
+                                 "W", "H", "Vertical mm", "Lbs", "Assigned Package"] if c in decision_df.columns]
     story.append(
         df_to_reportlab_table(
-            decision_df[decision_pdf_cols] if not decision_df.empty else decision_df,
-            max_rows=100,
-            font_size=6,
+            decision_df[decision_cols] if not decision_df.empty else decision_df,
+            max_rows=150, font_size=6,
         )
     )
-
-    story.append(PageBreak())
 
     container_L = float(vehicle_data["L"])
     container_W = float(vehicle_data["W"])
 
     for load in loads:
+        story.append(PageBreak())
         title = (
-            f"Container #{load['container_no']} — "
-            f"Floor Utilization: {load['util']:.1f}% — "
+            f"Container #{load['container_no']} - Floor Utilization: {load['util']:.1f}% - "
             f"Weight: {pounds_text(float(load.get('weight', 0)))}"
         )
-
         story.append(Paragraph(paragraph_safe(title), styles["Heading2"]))
         story.append(Spacer(1, 8))
 
-        if load.get("payload_over"):
-            story.append(
-                Paragraph(
-                    "WARNING: This container is over the configured payload limit.",
-                    styles["Heading4"],
-                )
-            )
-            story.append(Spacer(1, 6))
-
-        fig2d = build_2d_plan(
-            load["placed"],
-            container_L,
-            container_W,
-            order_color_map,
-            title_text=f"Container #{load['container_no']}",
-        )
-
         try:
-            img_bytes = fig2d.to_image(
-                format="png",
-                width=900,
-                height=380,
-                scale=2,
+            buf = render_mpl_2d_plan(
+                load["placed"], container_L, container_W, result["order_color_map"],
+                title_text=f"Container #{load['container_no']}",
             )
-            story.append(RLImage(BytesIO(img_bytes), width=680, height=290))
-
-        except Exception:
-            try:
-                mpl_buf = render_mpl_2d_plan(
-                    load["placed"],
-                    container_L,
-                    container_W,
-                    order_color_map,
-                    title_text=f"Container #{load['container_no']}",
-                )
-                story.append(RLImage(mpl_buf, width=680, height=290))
-
-            except Exception as e:
-                story.append(
-                    Paragraph(
-                        paragraph_safe(f"[Image generation failed: {e}]"),
-                        styles["Italic"],
-                    )
-                )
-
-        story.append(Spacer(1, 10))
-
-        if load["container_no"] != loads[-1]["container_no"]:
-            story.append(PageBreak())
+            story.append(RLImage(buf, width=680, height=290))
+        except Exception as e:  # noqa: BLE001
+            story.append(Paragraph(paragraph_safe(f"[Image generation failed: {e}]"), styles["Italic"]))
 
     final_overflow = result.get("final_overflow", [])
-
     if final_overflow:
         story.append(PageBreak())
-        story.append(Paragraph("Unpacked / Overflow Items", styles["Heading2"]))
+        story.append(Paragraph("Unpacked Packages", styles["Heading2"]))
         story.append(Spacer(1, 8))
-        story.append(
-            df_to_reportlab_table(
-                pd.DataFrame(final_overflow),
-                max_rows=100,
-                font_size=7,
-            )
-        )
+        overflow_cols = ["package_id", "kind", "order", "L", "W", "H", "weight", "unpacked_reason"]
+        overflow_df = pd.DataFrame(final_overflow)
+        overflow_df = overflow_df[[c for c in overflow_cols if c in overflow_df.columns]]
+        story.append(df_to_reportlab_table(overflow_df, max_rows=100, font_size=7))
 
     doc.build(story)
-
     return buffer.getvalue()
+
 
 # ==========================================================
 # 16. EXCEL EXPORT
 # ==========================================================
 
-def safe_sheet_name(name: str) -> str:
-    """
-    Excel sheet names cannot exceed 31 chars and cannot contain certain chars.
-    """
-    name = clean_str(name) or "Sheet"
-    name = re.sub(r"[\[\]\:\*\?\/\\]", "-", name)
-    return name[:31]
-
-
 def autosize_excel_columns(writer: pd.ExcelWriter) -> None:
-    """
-    Light formatting for Excel exports.
-    Requires openpyxl engine.
-    """
     try:
-        for sheet_name in writer.sheets:
-            worksheet = writer.sheets[sheet_name]
-
+        for worksheet in writer.sheets.values():
             for column_cells in worksheet.columns:
-                max_length = 0
-                column_letter = column_cells[0].column_letter
-
-                for cell in column_cells:
-                    value = "" if cell.value is None else str(cell.value)
-                    max_length = max(max_length, len(value))
-
-                adjusted_width = min(max(max_length + 2, 10), 60)
-                worksheet.column_dimensions[column_letter].width = adjusted_width
-
+                max_length = max(len("" if c.value is None else str(c.value)) for c in column_cells)
+                worksheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, 10), 60)
             worksheet.freeze_panes = "A2"
-
-    except Exception:
-        # Formatting failure should not block export.
+    except Exception:  # noqa: BLE001  formatting must never block export
         pass
 
 
@@ -3129,39 +2734,18 @@ def export_plan_to_excel_bytes(
     result: Dict[str, Any],
     scenario_df: Optional[pd.DataFrame] = None,
 ) -> bytes:
-    """
-    Creates an Excel workbook with practical review tabs.
-
-    Tabs:
-      - Summary
-      - Input Units
-      - Unit Issues
-      - Packages
-      - Container Loads
-      - Packing Decisions
-      - Packing Notes
-      - Overflow
-      - Scenarios
-      - Assumptions
-    """
     buffer = BytesIO()
 
     manifest_df = result.get("manifest_df", pd.DataFrame())
-    load_summary_df = result.get("load_summary_df", pd.DataFrame())
-    decision_df = result.get("decision_df", pd.DataFrame())
-    packing_notes_df = result.get("packing_notes_df", pd.DataFrame())
+    loads = result.get("loads", [])
     final_overflow = result.get("final_overflow", [])
     assumptions: LogisticsAssumptions = result["assumptions"]
+    lim: TransportLimits = result["limits"]
     vehicle_data = result["vehicle_data"]
+    counts = plan_class_counts(result)
 
-    total_weight = 0.0
-    if manifest_df is not None and not manifest_df.empty:
-        total_weight = float(manifest_df["Weight"].astype(float).sum())
-
-    avg_util = 0.0
-    loads = result.get("loads", [])
-    if loads:
-        avg_util = sum(float(load.get("util", 0)) for load in loads) / len(loads)
+    total_weight = float(manifest_df["Weight"].astype(float).sum()) if not manifest_df.empty else 0.0
+    avg_util = sum(float(ld.get("util", 0)) for ld in loads) / len(loads) if loads else 0.0
 
     summary_df = pd.DataFrame(
         [
@@ -3173,125 +2757,79 @@ def export_plan_to_excel_bytes(
             {"Metric": "Estimator", "Value": project.estimator},
             {"Metric": "Generated", "Value": now_stamp()},
             {"Metric": "Vehicle", "Value": result.get("vehicle_name", "")},
-            {
-                "Metric": "Vehicle Dims",
-                "Value": dim_text(
-                    float(vehicle_data["L"]),
-                    float(vehicle_data["W"]),
-                    float(vehicle_data["H"]),
-                ),
-            },
-            {
-                "Metric": "Vehicle Payload",
-                "Value": float(vehicle_data.get("max_lbs", 0) or 0),
-            },
+            {"Metric": "Vehicle Dims", "Value": dim_text(float(vehicle_data["L"]), float(vehicle_data["W"]),
+                                                         float(vehicle_data["H"]))},
+            {"Metric": "Vehicle Door Height", "Value": safe_float(vehicle_data.get("door_H"), None)},
+            {"Metric": "Max Package Height (in)", "Value": round(lim.usable_ext_h, 1)},
+            {"Metric": "Standard Pallet Max Unit (in)", "Value": round(lim.std_max_v, 1)},
+            {"Metric": "Low-Floor Max Unit (in)", "Value": round(lim.low_floor_max_v, 1)},
+            {"Metric": "Slant Max Unit (in)", "Value": round(lim.slant_max_v, 1)},
+            {"Metric": "Vehicle Payload", "Value": float(vehicle_data.get("max_lbs", 0) or 0)},
             {"Metric": "Total Weight", "Value": total_weight},
             {"Metric": "Containers Used", "Value": len(loads)},
-            {"Metric": "Crates", "Value": len(result.get("crates", []))},
+            {"Metric": "Crates / Racks", "Value": len(result.get("crates", []))},
             {"Metric": "Pallets", "Value": len(result.get("pallets", []))},
+            {"Metric": "Standard Pieces", "Value": counts.get(CLASS_STD, 0)},
+            {"Metric": "Low-Floor Pieces (no glass)", "Value": counts.get(CLASS_LOW, 0)},
+            {"Metric": "Slant Rack Pieces", "Value": counts.get(CLASS_SLANT, 0)},
+            {"Metric": "Disassembled Pieces", "Value": counts.get(CLASS_DIS, 0)},
+            {"Metric": "Oversize Pieces", "Value": counts.get(CLASS_OVERSIZE, 0)},
             {"Metric": "Average Floor Utilization %", "Value": round(avg_util, 1)},
-            {"Metric": "Unpacked Items", "Value": len(final_overflow)},
+            {"Metric": "Unpacked Packages", "Value": len(final_overflow)},
             {"Metric": "Planning Warning", "Value": assumptions.planning_warning},
         ]
     )
 
     assumptions_df = pd.DataFrame(
-        [
-            {"Assumption": "Glass kg/m²", "Value": assumptions.glass_kg_m2},
-            {"Assumption": "Std Weight Multiplier", "Value": assumptions.std_weight_multiplier},
-            {"Assumption": "LSD Weight Multiplier", "Value": assumptions.lsd_weight_multiplier},
-            {"Assumption": "Frame/Kit Weight %", "Value": assumptions.frame_kit_weight_pct},
-            {"Assumption": "Max Crate Lbs", "Value": assumptions.max_crate_lbs},
-            {"Assumption": "Max Pallet Lbs", "Value": assumptions.max_pallet_lbs},
-            {"Assumption": "Max Crate Length Ext", "Value": assumptions.crate_max_len_ext},
-            {"Assumption": "Max Crate Width Ext", "Value": assumptions.crate_max_width_ext},
-            {"Assumption": "Vehicle Height Clearance", "Value": assumptions.vehicle_height_clearance},
-            {"Assumption": "Container Item Clearance", "Value": assumptions.container_item_clearance},
-            {"Assumption": "No Mixing Orders", "Value": assumptions.no_mixing_orders},
-            {
-                "Assumption": "Allow Pallets for Disassembled",
-                "Value": assumptions.allow_pallets_for_disassembled,
-            },
-        ]
+        [{"Assumption": k, "Value": v} for k, v in asdict(assumptions).items()]
     )
 
-    overflow_df = pd.DataFrame(final_overflow)
+    sheets = [
+        ("Summary", summary_df),
+        ("Input Units", master_df),
+        ("Unit Issues", unit_issue_df),
+        ("Packages", manifest_df),
+        ("Container Loads", result.get("load_summary_df")),
+        ("Packing Decisions", result.get("decision_df")),
+        ("Packing Notes", result.get("packing_notes_df")),
+        ("Unpacked", pd.DataFrame(final_overflow)),
+        ("Scenarios", scenario_df),
+        ("Assumptions", assumptions_df),
+    ]
 
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        summary_df.to_excel(writer, sheet_name="Summary", index=False)
-
-        if master_df is not None and not master_df.empty:
-            master_df.to_excel(writer, sheet_name="Input Units", index=False)
-
-        if unit_issue_df is not None and not unit_issue_df.empty:
-            unit_issue_df.to_excel(writer, sheet_name="Unit Issues", index=False)
-
-        if manifest_df is not None and not manifest_df.empty:
-            manifest_df.to_excel(writer, sheet_name="Packages", index=False)
-
-        if load_summary_df is not None and not load_summary_df.empty:
-            load_summary_df.to_excel(writer, sheet_name="Container Loads", index=False)
-
-        if decision_df is not None and not decision_df.empty:
-            decision_df.to_excel(writer, sheet_name="Packing Decisions", index=False)
-
-        if packing_notes_df is not None and not packing_notes_df.empty:
-            packing_notes_df.to_excel(writer, sheet_name="Packing Notes", index=False)
-
-        if overflow_df is not None and not overflow_df.empty:
-            overflow_df.to_excel(writer, sheet_name="Overflow", index=False)
-
-        if scenario_df is not None and not scenario_df.empty:
-            scenario_df.to_excel(writer, sheet_name="Scenarios", index=False)
-
-        assumptions_df.to_excel(writer, sheet_name="Assumptions", index=False)
-
+        for sheet_name, df in sheets:
+            if df is not None and not df.empty:
+                df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
         autosize_excel_columns(writer)
 
     buffer.seek(0)
     return buffer.getvalue()
+
 
 # ==========================================================
 # 17. SAVE / LOAD JOB JSON HELPERS
 # ==========================================================
 
 def project_from_dict(data: Dict[str, Any]) -> ProjectMeta:
-    return ProjectMeta(
-        project_name=clean_str(data.get("project_name")),
-        customer=clean_str(data.get("customer")),
-        project_location=clean_str(data.get("project_location")),
-        destination=clean_str(data.get("destination")),
-        factory=clean_str(data.get("factory")),
-        system=clean_str(data.get("system")),
-        estimator=clean_str(data.get("estimator")),
-        estimator_email=clean_str(data.get("estimator_email")),
-        quote_or_job_ref=clean_str(data.get("quote_or_job_ref")),
-        revision=clean_str(data.get("revision")),
-        notes=clean_str(data.get("notes")),
-    )
+    return ProjectMeta(**{k: clean_str(data.get(k)) for k in ProjectMeta.__dataclass_fields__})
 
 
 def assumptions_from_dict(data: Dict[str, Any]) -> LogisticsAssumptions:
-    return LogisticsAssumptions(
-        glass_kg_m2=float(data.get("glass_kg_m2", 30.0)),
-        std_weight_multiplier=float(data.get("std_weight_multiplier", 1.35)),
-        lsd_weight_multiplier=float(data.get("lsd_weight_multiplier", 1.40)),
-        frame_kit_weight_pct=float(data.get("frame_kit_weight_pct", 0.20)),
-        max_crate_lbs=float(data.get("max_crate_lbs", 2500.0)),
-        max_pallet_lbs=float(data.get("max_pallet_lbs", 2200.0)),
-        crate_max_len_ext=float(data.get("crate_max_len_ext", DEFAULT_CRATE_MAX_LEN_EXT)),
-        crate_max_width_ext=float(data.get("crate_max_width_ext", DEFAULT_CRATE_MAX_WIDTH_EXT)),
-        vehicle_height_clearance=float(data.get("vehicle_height_clearance", DEFAULT_HEIGHT_CLEARANCE)),
-        container_item_clearance=float(data.get("container_item_clearance", DEFAULT_CONTAINER_ITEM_CLEARANCE)),
-        no_mixing_orders=bool(data.get("no_mixing_orders", True)),
-        allow_pallets_for_disassembled=bool(data.get("allow_pallets_for_disassembled", True)),
-        planning_warning=clean_str(
-            data.get(
-                "planning_warning",
-                LogisticsAssumptions().planning_warning,
-            )
-        ),
-    )
+    """Loads assumptions; unknown keys are ignored and missing keys use defaults."""
+    defaults = LogisticsAssumptions()
+    values: Dict[str, Any] = {}
+
+    for name, default in asdict(defaults).items():
+        raw = data.get(name, default)
+        if isinstance(default, bool):
+            values[name] = bool(raw)
+        elif isinstance(default, (int, float)):
+            values[name] = float(safe_float(raw, default))
+        else:
+            values[name] = clean_str(raw) or default
+
+    return LogisticsAssumptions(**values)
 
 
 def build_job_save_payload(
@@ -3302,53 +2840,33 @@ def build_job_save_payload(
     selected_vehicle: str,
     selected_pallets: List[str],
 ) -> Dict[str, Any]:
-    """
-    Creates a JSON-safe payload for saving/reloading a job.
-    """
-    if master_df is not None and not master_df.empty:
-        master_records = master_df.to_dict(orient="records")
-    else:
-        master_records = []
-
+    records = master_df.to_dict(orient="records") if master_df is not None and not master_df.empty else []
     return {
-        "app": "UltraLogistics Pro",
-        "version": "2026-07-02",
+        "app": APP_NAME,
+        "version": APP_VERSION,
         "saved_at": now_stamp(),
         "project": asdict(project),
         "assumptions": asdict(assumptions),
         "orders": orders,
-        "master_rows": master_records,
+        "master_rows": records,
         "selected_vehicle": selected_vehicle,
         "selected_pallets": selected_pallets,
     }
 
 
-def load_job_payload(
-    payload: Dict[str, Any],
-) -> Dict[str, Any]:
-    """
-    Converts saved job JSON back into typed app objects.
-    """
-    project = project_from_dict(payload.get("project", {}))
-    assumptions = assumptions_from_dict(payload.get("assumptions", {}))
+def load_job_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    project = project_from_dict(payload.get("project", {}) or {})
+    assumptions = assumptions_from_dict(payload.get("assumptions", {}) or {})
 
     orders = payload.get("orders", {})
     if not isinstance(orders, dict):
         orders = {}
 
-    master_rows = payload.get("master_rows", [])
-    master_df = pd.DataFrame(master_rows)
-
+    master_df = pd.DataFrame(payload.get("master_rows", []) or [])
     if not master_df.empty:
-        for col in MASTER_COLUMNS:
-            if col not in master_df.columns:
-                master_df[col] = ""
+        master_df = normalize_master_df(master_df, assumptions)
 
-        master_df = master_df[MASTER_COLUMNS]
-
-    selected_vehicle = clean_str(payload.get("selected_vehicle"))
     selected_pallets = payload.get("selected_pallets", [])
-
     if not isinstance(selected_pallets, list):
         selected_pallets = []
 
@@ -3357,43 +2875,29 @@ def load_job_payload(
         "assumptions": assumptions,
         "orders": orders,
         "master_df": master_df,
-        "selected_vehicle": selected_vehicle,
+        "selected_vehicle": clean_str(payload.get("selected_vehicle")),
         "selected_pallets": selected_pallets,
     }
 
 
 def read_uploaded_json(uploaded_file) -> Dict[str, Any]:
-    raw = uploaded_file.read()
-
+    raw = uploaded_file.getvalue() if hasattr(uploaded_file, "getvalue") else uploaded_file.read()
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
-
     return json.loads(raw)
+
 
 # ==========================================================
 # 18. CUSTOM VEHICLE / PALLET CONFIG HELPERS
 # ==========================================================
 
 def sample_config_json() -> Dict[str, Any]:
-    """
-    Example config users can copy, edit, and upload.
-    """
     return {
         "vehicles": {
-            "Custom Trailer Example": {
-                "L": 600,
-                "W": 96,
-                "H": 106,
-                "max_lbs": 44000,
-            }
+            "Custom Trailer Example": {"L": 600, "W": 96, "H": 106, "door_H": 104, "max_lbs": 44000}
         },
         "pallets": {
-            "Factory Rack Example": {
-                "L": 120,
-                "W": 48,
-                "H": 8,
-                "max_lbs": 3000,
-            }
+            "Factory Rack Example": {"L": 120, "W": 48, "H": 8, "max_lbs": 3000}
         },
     }
 
@@ -3402,17 +2906,8 @@ def merge_custom_config(
     uploaded_config: Optional[Dict[str, Any]],
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]], List[str]]:
     """
-    Merges optional uploaded JSON config with default vehicles/pallets.
-
-    Expected JSON format:
-        {
-          "vehicles": {
-            "Name": {"L": 473, "W": 92, "H": 105, "max_lbs": 44000}
-          },
-          "pallets": {
-            "Name": {"L": 48, "W": 40, "H": 6, "max_lbs": 2200}
-          }
-        }
+    Merges an optional uploaded config with the default vehicles/pallets.
+    Vehicles: L, W, H, door_H (optional), max_lbs. Pallets: L, W, H, max_lbs.
     """
     vehicles = json.loads(json.dumps(DEFAULT_CONTAINERS))
     pallets = json.loads(json.dumps(DEFAULT_PALLETS))
@@ -3427,20 +2922,25 @@ def merge_custom_config(
     if not isinstance(vehicle_rows, dict):
         warnings.append("Config field 'vehicles' must be an object/dictionary.")
         vehicle_rows = {}
-
     if not isinstance(pallet_rows, dict):
         warnings.append("Config field 'pallets' must be an object/dictionary.")
         pallet_rows = {}
 
     for name, spec in vehicle_rows.items():
         try:
-            vehicles[clean_str(name)] = {
+            entry = {
                 "L": float(spec["L"]),
                 "W": float(spec["W"]),
                 "H": float(spec["H"]),
                 "max_lbs": float(spec.get("max_lbs", 0) or 0),
             }
-        except Exception:
+            door = safe_float(spec.get("door_H"), None)
+            if door:
+                entry["door_H"] = door
+            else:
+                warnings.append(f"Vehicle '{name}' has no door_H; interior height used as loading limit.")
+            vehicles[clean_str(name)] = entry
+        except Exception:  # noqa: BLE001
             warnings.append(f"Skipped invalid vehicle config: {name}")
 
     for name, spec in pallet_rows.items():
@@ -3451,19 +2951,17 @@ def merge_custom_config(
                 "H": float(spec.get("H", PALLET_H)),
                 "max_lbs": float(spec.get("max_lbs", 2200) or 2200),
             }
-        except Exception:
+        except Exception:  # noqa: BLE001
             warnings.append(f"Skipped invalid pallet config: {name}")
 
     return vehicles, pallets, warnings
+
 
 # ==========================================================
 # 19. STREAMLIT SESSION STATE
 # ==========================================================
 
 def init_session_state() -> None:
-    """
-    Initializes all app-level session state keys.
-    """
     defaults = {
         "project": ProjectMeta(),
         "assumptions": LogisticsAssumptions(),
@@ -3472,16 +2970,13 @@ def init_session_state() -> None:
         "results": None,
         "unit_issue_df": pd.DataFrame(),
         "scenario_df": pd.DataFrame(),
-        "uploaded_source_df": None,
-        "uploaded_source_name": "",
-        "uploaded_mapping": {},
         "vehicle_catalog": DEFAULT_CONTAINERS,
         "pallet_catalog": DEFAULT_PALLETS,
         "selected_vehicle": "40' HC Container",
-        "selected_pallets": ["US GMA (48x40)"],
+        "selected_pallets": ["Euro 2 (1200x1000mm)", "Factory (2200x1000mm)"],
         "last_validation_df": pd.DataFrame(),
+        "editor_version": 0,
     }
-
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -3492,52 +2987,45 @@ def clear_results() -> None:
     st.session_state.scenario_df = pd.DataFrame()
 
 
-def set_project_from_widgets(project: ProjectMeta) -> None:
-    st.session_state.project = project
-
-
-def set_assumptions_from_widgets(assumptions: LogisticsAssumptions) -> None:
-    st.session_state.assumptions = assumptions
+def set_master_df(df: Optional[pd.DataFrame]) -> None:
+    """Stores a new master table and resets the editor widget state."""
+    st.session_state.df_master = df
+    st.session_state.editor_version += 1
+    clear_results()
 
 
 def apply_loaded_job_to_session(loaded: Dict[str, Any]) -> None:
-    """
-    Applies loaded JSON job data into Streamlit session state.
-    """
     st.session_state.project = loaded["project"]
     st.session_state.assumptions = loaded["assumptions"]
     st.session_state.orders = loaded["orders"]
-    st.session_state.df_master = loaded["master_df"]
 
-    if loaded["selected_vehicle"]:
+    if loaded["selected_vehicle"] in st.session_state.vehicle_catalog:
         st.session_state.selected_vehicle = loaded["selected_vehicle"]
 
-    if loaded["selected_pallets"]:
-        st.session_state.selected_pallets = loaded["selected_pallets"]
+    valid_pallets = [p for p in loaded["selected_pallets"] if p in st.session_state.pallet_catalog]
+    if valid_pallets:
+        st.session_state.selected_pallets = valid_pallets
 
-    clear_results()
+    set_master_df(loaded["master_df"])
+
+
+def current_limits() -> TransportLimits:
+    vehicle_data = st.session_state.vehicle_catalog[st.session_state.selected_vehicle]
+    return get_transport_limits(vehicle_data, st.session_state.assumptions)
+
+
+def has_master() -> bool:
+    df = st.session_state.df_master
+    return df is not None and not df.empty
+
 
 # ==========================================================
-# 20. MAIN APP SETUP
-# ==========================================================
-
-st.set_page_config(
-    page_title="UltraLogistics Pro",
-    layout="wide",
-)
-
-init_session_state()
-
-
-# ==========================================================
-# LOGIN / AUTHENTICATION
+# 20. LOGIN / AUTHENTICATION
 # ==========================================================
 
 def check_password() -> bool:
     """
-    Simple username/password gate using Streamlit secrets.
-
-    Expected secrets format:
+    Username/password gate using Streamlit secrets:
 
     [passwords]
     admin = "your_password"
@@ -3546,17 +3034,15 @@ def check_password() -> bool:
     if st.session_state.get("authenticated", False):
         return True
 
-    st.title("🔐 UltraLogistics Pro Login")
+    st.title(f"🔐 {APP_NAME} Login")
 
     try:
         valid_passwords = dict(st.secrets.get("passwords", {}))
-    except Exception:
+    except Exception:  # noqa: BLE001
         valid_passwords = {}
 
     if not valid_passwords:
-        st.error(
-            "No passwords are configured. Add a [passwords] section in Streamlit secrets."
-        )
+        st.error("No passwords are configured. Add a [passwords] section in Streamlit secrets.")
         st.stop()
 
     with st.form("login_form"):
@@ -3566,333 +3052,248 @@ def check_password() -> bool:
 
     if submitted:
         username = clean_str(username)
-
         if username in valid_passwords and hmac.compare_digest(
-            password,
-            str(valid_passwords[username]),
+            password.encode("utf-8"), str(valid_passwords[username]).encode("utf-8")
         ):
             st.session_state.authenticated = True
             st.session_state.username = username
             st.rerun()
-
         else:
             st.error("Invalid username or password.")
 
     st.stop()
+    return False
 
-
-check_password()
-
-st.title("🚚 UltraLogistics Pro")
 
 # ==========================================================
 # 21. SIDEBAR: CONFIG, PROJECT, ASSUMPTIONS
 # ==========================================================
 
-with st.sidebar:
-    st.title("⚙️ Setup")
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.title("⚙️ Setup")
+        st.caption(f"Logged in as: {st.session_state.get('username', '')}")
 
-    st.caption(f"Logged in as: {st.session_state.get('username', '')}")
+        if st.button("Logout", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.username = ""
+            st.rerun()
 
-    if st.button("Logout", use_container_width=True):
-        st.session_state.authenticated = False
-        st.session_state.username = ""
-        st.rerun()
+        st.markdown("---")
 
-    st.markdown("---")
+        with st.expander("Custom Vehicles / Pallets", expanded=False):
+            st.caption("Optional JSON config. Vehicles: L, W, H, door_H, max_lbs (inches / lbs).")
+            st.download_button(
+                "Download Sample Config JSON",
+                data=json_download_bytes(sample_config_json()),
+                file_name="ultralogistics_config_sample.json",
+                mime="application/json",
+                use_container_width=True,
+            )
 
-    # ------------------------------------------------------
-    # Custom vehicle / pallet config
-    # ------------------------------------------------------
-    with st.expander("Custom Vehicles / Pallets", expanded=False):
-        st.caption("Optional JSON config for custom vehicles and pallet/rack sizes.")
-
-        st.download_button(
-            "Download Sample Config JSON",
-            data=json_download_bytes(sample_config_json()),
-            file_name="ultralogistics_config_sample.json",
-            mime="application/json",
-            use_container_width=True,
-        )
-
-        config_upload = st.file_uploader(
-            "Upload Config JSON",
-            type=["json"],
-            key="config_upload",
-        )
-
-        uploaded_config = None
-
-        if config_upload is not None:
-            try:
-                uploaded_config = read_uploaded_json(config_upload)
-                st.success("Config JSON loaded.")
-            except Exception as e:
-                st.error(f"Could not read config JSON: {e}")
-
-        vehicle_catalog, pallet_catalog, config_warnings = merge_custom_config(
-            uploaded_config
-        )
-
-        for warning in config_warnings:
-            st.warning(warning)
-
-        st.session_state.vehicle_catalog = vehicle_catalog
-        st.session_state.pallet_catalog = pallet_catalog
-
-    # ------------------------------------------------------
-    # Load saved job
-    # ------------------------------------------------------
-    with st.expander("Load Saved Job", expanded=False):
-        job_upload = st.file_uploader(
-            "Upload saved job JSON",
-            type=["json"],
-            key="job_upload",
-        )
-
-        if st.button("Load Job JSON", use_container_width=True):
-            if job_upload is None:
-                st.warning("Upload a job JSON first.")
-            else:
+            config_upload = st.file_uploader("Upload Config JSON", type=["json"], key="config_upload")
+            uploaded_config = None
+            if config_upload is not None:
                 try:
-                    payload = read_uploaded_json(job_upload)
-                    loaded = load_job_payload(payload)
-                    apply_loaded_job_to_session(loaded)
-                    st.success("Job loaded.")
-                except Exception as e:
-                    st.error(f"Could not load job JSON: {e}")
+                    uploaded_config = read_uploaded_json(config_upload)
+                    st.success("Config JSON loaded.")
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"Could not read config JSON: {e}")
 
-    # ------------------------------------------------------
-    # Project metadata
-    # ------------------------------------------------------
-    with st.expander("Project Metadata", expanded=True):
-        p0: ProjectMeta = st.session_state.project
+            vehicle_catalog, pallet_catalog, config_warnings = merge_custom_config(uploaded_config)
+            for warning in config_warnings:
+                st.warning(warning)
 
-        project = ProjectMeta(
-            project_name=st.text_input("Project Name", value=p0.project_name),
-            customer=st.text_input("Customer", value=p0.customer),
-            project_location=st.text_input("Project Location", value=p0.project_location),
-            destination=st.text_input("Destination", value=p0.destination),
-            factory=st.text_input("Factory", value=p0.factory),
-            system=st.text_input("System", value=p0.system),
-            estimator=st.text_input("Estimator", value=p0.estimator),
-            estimator_email=st.text_input("Estimator Email", value=p0.estimator_email),
-            quote_or_job_ref=st.text_input("Quote / Job Ref", value=p0.quote_or_job_ref),
-            revision=st.text_input("Revision", value=p0.revision),
-            notes=st.text_area("Project Notes", value=p0.notes, height=80),
-        )
+            st.session_state.vehicle_catalog = vehicle_catalog
+            st.session_state.pallet_catalog = pallet_catalog
 
-        set_project_from_widgets(project)
+        with st.expander("Load Saved Job", expanded=False):
+            job_upload = st.file_uploader("Upload saved job JSON", type=["json"], key="job_upload")
+            if st.button("Load Job JSON", use_container_width=True):
+                if job_upload is None:
+                    st.warning("Upload a job JSON first.")
+                else:
+                    try:
+                        apply_loaded_job_to_session(load_job_payload(read_uploaded_json(job_upload)))
+                        st.success("Job loaded.")
+                    except Exception as e:  # noqa: BLE001
+                        st.error(f"Could not load job JSON: {e}")
 
-    # ------------------------------------------------------
-    # Weight and packing assumptions
-    # ------------------------------------------------------
-    with st.expander("Weight / Packing Assumptions", expanded=True):
+        with st.expander("Project Metadata", expanded=False):
+            p0: ProjectMeta = st.session_state.project
+            st.session_state.project = ProjectMeta(
+                project_name=st.text_input("Project Name", value=p0.project_name),
+                customer=st.text_input("Customer", value=p0.customer),
+                project_location=st.text_input("Project Location", value=p0.project_location),
+                destination=st.text_input("Destination", value=p0.destination),
+                factory=st.text_input("Factory", value=p0.factory),
+                system=st.text_input("System", value=p0.system),
+                estimator=st.text_input("Estimator", value=p0.estimator),
+                estimator_email=st.text_input("Estimator Email", value=p0.estimator_email),
+                quote_or_job_ref=st.text_input("Quote / Job Ref", value=p0.quote_or_job_ref),
+                revision=st.text_input("Revision", value=p0.revision),
+                notes=st.text_area("Project Notes", value=p0.notes, height=80),
+            )
+
         a0: LogisticsAssumptions = st.session_state.assumptions
 
-        assumptions = LogisticsAssumptions(
-            glass_kg_m2=st.number_input(
-                "Glass kg/m²",
-                min_value=10.0,
-                max_value=80.0,
-                value=float(a0.glass_kg_m2),
-                step=1.0,
-            ),
-            std_weight_multiplier=st.number_input(
-                "Total Weight Multiplier - Standard",
-                min_value=1.0,
-                max_value=3.0,
-                value=float(a0.std_weight_multiplier),
-                step=0.05,
-            ),
-            lsd_weight_multiplier=st.number_input(
-                "Total Weight Multiplier - LSD / Sliding",
-                min_value=1.0,
-                max_value=3.0,
-                value=float(a0.lsd_weight_multiplier),
-                step=0.05,
-            ),
-            frame_kit_weight_pct=st.slider(
-                "Frame / Kit Weight %",
-                min_value=0.0,
-                max_value=0.5,
-                value=float(a0.frame_kit_weight_pct),
-                step=0.01,
-            ),
-            max_crate_lbs=st.number_input(
-                "Max Crate Lbs",
-                min_value=500.0,
-                max_value=12000.0,
-                value=float(a0.max_crate_lbs),
-                step=100.0,
-            ),
-            max_pallet_lbs=st.number_input(
-                "Max Pallet Lbs",
-                min_value=500.0,
-                max_value=10000.0,
-                value=float(a0.max_pallet_lbs),
-                step=100.0,
-            ),
-            crate_max_len_ext=st.number_input(
-                "Max Crate Length Ext",
-                min_value=48.0,
-                max_value=800.0,
-                value=float(a0.crate_max_len_ext),
-                step=6.0,
-            ),
-            crate_max_width_ext=st.number_input(
-                "Max Crate Width / Depth Ext",
-                min_value=12.0,
-                max_value=120.0,
-                value=float(a0.crate_max_width_ext),
-                step=1.0,
-            ),
-            vehicle_height_clearance=st.number_input(
-                "Vehicle Height Clearance",
-                min_value=0.0,
-                max_value=24.0,
-                value=float(a0.vehicle_height_clearance),
-                step=0.5,
-            ),
-            container_item_clearance=st.number_input(
-                "Floor Item Clearance",
-                min_value=0.0,
-                max_value=12.0,
-                value=float(a0.container_item_clearance),
-                step=0.5,
-            ),
-            no_mixing_orders=st.checkbox(
-                "Do not mix orders inside crates/pallets",
-                value=bool(a0.no_mixing_orders),
-            ),
-            allow_pallets_for_disassembled=st.checkbox(
-                "Use pallets for disassembled pieces",
-                value=bool(a0.allow_pallets_for_disassembled),
-            ),
-            planning_warning=a0.planning_warning,
+        with st.expander("Factory Transport Rules", expanded=True):
+            st.caption("Unit height as shipped (vertical). Defaults follow the factory 40' HC guidance.")
+            factory_std_max_mm = st.number_input(
+                "Standard pallet max (mm)", min_value=500.0, max_value=4000.0,
+                value=float(a0.factory_std_max_mm), step=1.0,
+            )
+            allow_low_floor = st.checkbox(
+                "Allow low-floor pallet (unit ships without glass)", value=bool(a0.allow_low_floor),
+            )
+            factory_low_floor_max_mm = st.number_input(
+                "Low-floor pallet max (mm)", min_value=500.0, max_value=4000.0,
+                value=float(a0.factory_low_floor_max_mm), step=1.0, disabled=not allow_low_floor,
+            )
+            factory_slant_max_mm = st.number_input(
+                "Slant rack max unit height (mm)", min_value=500.0, max_value=5000.0,
+                value=float(a0.factory_slant_max_mm), step=1.0,
+            )
+            std_pack_overhead = st.number_input(
+                "Standard package height overhead (in)", min_value=0.0, max_value=24.0,
+                value=float(a0.std_pack_overhead), step=0.5,
+                help="Pallet/crate base + top added to the unit height.",
+            )
+            low_floor_pack_overhead = st.number_input(
+                "Low-floor package height overhead (in)", min_value=0.0, max_value=24.0,
+                value=float(a0.low_floor_pack_overhead), step=0.5,
+            )
+
+        with st.expander("Weight / Packing Assumptions", expanded=False):
+            assumptions = LogisticsAssumptions(
+                glass_kg_m2=st.number_input("Glass kg/m²", min_value=10.0, max_value=80.0,
+                                            value=float(a0.glass_kg_m2), step=1.0),
+                std_weight_multiplier=st.number_input("Total Weight Multiplier - Standard", min_value=1.0,
+                                                      max_value=3.0, value=float(a0.std_weight_multiplier),
+                                                      step=0.05),
+                lsd_weight_multiplier=st.number_input("Total Weight Multiplier - LSD / Sliding", min_value=1.0,
+                                                      max_value=3.0, value=float(a0.lsd_weight_multiplier),
+                                                      step=0.05),
+                frame_kit_pct_disassembly=st.slider("Frame kit share - forced disassembly", 0.0, 0.5,
+                                                    float(a0.frame_kit_pct_disassembly), 0.01),
+                frame_kit_pct_split=st.slider("Frame kit share - disassembly with manual split", 0.0, 0.5,
+                                              float(a0.frame_kit_pct_split), 0.01),
+                max_crate_lbs=st.number_input("Max Crate Lbs", min_value=500.0, max_value=12000.0,
+                                              value=float(a0.max_crate_lbs), step=100.0),
+                max_pallet_lbs=st.number_input("Max Pallet Lbs", min_value=500.0, max_value=10000.0,
+                                               value=float(a0.max_pallet_lbs), step=100.0),
+                crate_max_len_ext=st.number_input("Max Crate Length Ext (in)", min_value=48.0, max_value=800.0,
+                                                  value=float(a0.crate_max_len_ext), step=6.0),
+                crate_max_width_ext=st.number_input("Max Crate Width / Depth Ext (in)", min_value=12.0,
+                                                    max_value=120.0, value=float(a0.crate_max_width_ext),
+                                                    step=1.0),
+                slant_rack_max_depth_ext=st.number_input("Max Slant Rack Depth Ext (in)", min_value=12.0,
+                                                         max_value=120.0,
+                                                         value=float(a0.slant_rack_max_depth_ext), step=1.0),
+                crate_max_volume_ext=st.number_input("Max Crate Volume Ext (in³)", min_value=10_000.0,
+                                                     max_value=5_000_000.0,
+                                                     value=float(a0.crate_max_volume_ext), step=50_000.0),
+                vehicle_height_clearance=st.number_input("Vehicle/Door Height Clearance (in)", min_value=0.0,
+                                                         max_value=24.0,
+                                                         value=float(a0.vehicle_height_clearance), step=0.5),
+                container_item_clearance=st.number_input("Floor Item Clearance (in)", min_value=0.0,
+                                                         max_value=12.0,
+                                                         value=float(a0.container_item_clearance), step=0.5),
+                factory_std_max_mm=factory_std_max_mm,
+                factory_low_floor_max_mm=factory_low_floor_max_mm,
+                factory_slant_max_mm=factory_slant_max_mm,
+                allow_low_floor=allow_low_floor,
+                std_pack_overhead=std_pack_overhead,
+                low_floor_pack_overhead=low_floor_pack_overhead,
+                no_mixing_orders=st.checkbox("Do not mix orders inside crates/pallets",
+                                             value=bool(a0.no_mixing_orders)),
+                allow_pallets_for_disassembled=st.checkbox("Use pallets for disassembled pieces",
+                                                           value=bool(a0.allow_pallets_for_disassembled)),
+                planning_warning=a0.planning_warning,
+            )
+
+        # Compare by value: Streamlit re-executes the script on every rerun, so the
+        # stored object belongs to an older copy of the class and == would fail.
+        if asdict(assumptions) != asdict(st.session_state.assumptions):
+            st.session_state.assumptions = assumptions
+            clear_results()
+
+        st.markdown("---")
+        st.subheader("Vehicle / Pallets")
+
+        vehicle_names = list(st.session_state.vehicle_catalog.keys())
+        if st.session_state.selected_vehicle not in vehicle_names:
+            st.session_state.selected_vehicle = vehicle_names[0]
+
+        selected_vehicle = st.selectbox(
+            "Vehicle", vehicle_names, index=vehicle_names.index(st.session_state.selected_vehicle),
+        )
+        if selected_vehicle != st.session_state.selected_vehicle:
+            st.session_state.selected_vehicle = selected_vehicle
+            clear_results()
+
+        pallet_names = list(st.session_state.pallet_catalog.keys())
+        valid_default = [p for p in st.session_state.selected_pallets if p in pallet_names]
+        if not valid_default and pallet_names:
+            valid_default = [pallet_names[0]]
+
+        st.session_state.selected_pallets = st.multiselect(
+            "Pallets / Racks Allowed (disassembled parts)", pallet_names, default=valid_default,
         )
 
-        set_assumptions_from_widgets(assumptions)
+        vehicle_data = st.session_state.vehicle_catalog[selected_vehicle]
+        lim = current_limits()
+        door = safe_float(vehicle_data.get("door_H"), None)
 
-    # ------------------------------------------------------
-    # Vehicle and pallet selection
-    # ------------------------------------------------------
-    st.markdown("---")
-    st.subheader("Vehicle / Pallets")
+        st.caption(
+            f'Interior: {vehicle_data["L"]:.0f}"L x {vehicle_data["W"]:.0f}"W x {vehicle_data["H"]:.0f}"H'
+            + (f' · door {door:.1f}"' if door else " · no door height set")
+        )
+        st.caption(
+            f"Max package height: {inches_mm_text(lim.usable_ext_h)}  \n"
+            f"Standard pallet unit ≤ {inches_mm_text(lim.std_max_v)}  \n"
+            f"Low-floor unit (no glass) ≤ {inches_mm_text(lim.low_floor_max_v)}  \n"
+            f"Slant rack unit ≤ {inches_mm_text(lim.slant_max_v)}"
+        )
 
-    vehicle_names = list(st.session_state.vehicle_catalog.keys())
+        st.markdown("---")
+        st.subheader("Save Job")
+        st.download_button(
+            "Download Job JSON",
+            data=json_download_bytes(
+                build_job_save_payload(
+                    st.session_state.project,
+                    st.session_state.assumptions,
+                    st.session_state.orders,
+                    st.session_state.df_master,
+                    st.session_state.selected_vehicle,
+                    st.session_state.selected_pallets,
+                )
+            ),
+            file_name=f"{today_file_stamp()}-{slugify(st.session_state.project.display_name())}-logistics-plan.json",
+            mime="application/json",
+            use_container_width=True,
+            key="sidebar_job_download",
+        )
 
-    if st.session_state.selected_vehicle not in vehicle_names:
-        st.session_state.selected_vehicle = vehicle_names[0]
-
-    selected_vehicle = st.selectbox(
-        "Vehicle",
-        vehicle_names,
-        index=vehicle_names.index(st.session_state.selected_vehicle),
-    )
-
-    st.session_state.selected_vehicle = selected_vehicle
-
-    pallet_names = list(st.session_state.pallet_catalog.keys())
-
-    valid_default_pallets = [
-        p
-        for p in st.session_state.selected_pallets
-        if p in pallet_names
-    ]
-
-    if not valid_default_pallets and pallet_names:
-        valid_default_pallets = [pallet_names[0]]
-
-    selected_pallets = st.multiselect(
-        "Pallets / Racks Allowed",
-        pallet_names,
-        default=valid_default_pallets,
-    )
-
-    st.session_state.selected_pallets = selected_pallets
-
-    vehicle_data = st.session_state.vehicle_catalog[selected_vehicle]
-
-    st.caption(
-        f'Vehicle dims: {vehicle_data["L"]:.0f}"L x '
-        f'{vehicle_data["W"]:.0f}"W x {vehicle_data["H"]:.0f}"H'
-    )
-
-    st.caption(
-        f'Usable internal crate height: '
-        f'{get_vehicle_internal_crate_height_limit(vehicle_data, assumptions.vehicle_height_clearance):.1f}"'
-    )
-
-    # ------------------------------------------------------
-    # Save job
-    # ------------------------------------------------------
-    st.markdown("---")
-    st.subheader("Save Job")
-
-    save_payload = build_job_save_payload(
-        project=st.session_state.project,
-        assumptions=st.session_state.assumptions,
-        orders=st.session_state.orders,
-        master_df=st.session_state.df_master,
-        selected_vehicle=st.session_state.selected_vehicle,
-        selected_pallets=st.session_state.selected_pallets,
-    )
-
-    save_name = (
-        f"{today_file_stamp()}-"
-        f"{slugify(st.session_state.project.display_name())}-"
-        f"logistics-plan.json"
-    )
-
-    st.download_button(
-        "Download Job JSON",
-        data=json_download_bytes(save_payload),
-        file_name=save_name,
-        mime="application/json",
-        use_container_width=True,
-    )
 
 # ==========================================================
-# 22. MAIN TABS
+# 22. TAB 1 — DATA INPUT
 # ==========================================================
 
-tab_input, tab_edit, tab_optimize, tab_results, tab_scenarios = st.tabs(
-    [
-        "1️⃣ Data Input",
-        "2️⃣ Edit & Validate",
-        "3️⃣ Optimize",
-        "4️⃣ Results & Export",
-        "5️⃣ Scenarios",
-    ]
-)
-
-# ==========================================================
-# 23. TAB 1 — DATA INPUT
-# ==========================================================
-
-with tab_input:
+def render_tab_input() -> None:
     st.header("Data Input")
-
     st.info(
-        "You can paste order rows manually or upload an Excel/CSV file. "
-        "Expected manual paste format: ID, W, H, Type, Qty"
+        "Paste order rows manually or upload an Excel/CSV file. "
+        "Manual paste format: ID, W, H, Type, Qty (inches)."
     )
 
     c_left, c_right = st.columns([1, 1])
 
-    # ------------------------------------------------------
-    # Manual paste orders
-    # ------------------------------------------------------
     with c_left:
         st.subheader("Manual Order Paste")
 
-        order_name = st.text_input(
-            "Order Name",
-            value="Order 1",
-            key="manual_order_name",
-        )
-
+        order_name = st.text_input("Order Name", value="Order 1", key="manual_order_name")
         raw_in = st.text_area(
             "Paste rows: ID, W, H, Type, Qty",
             height=180,
@@ -3901,14 +3302,12 @@ with tab_input:
         )
 
         c_add, c_clear = st.columns(2)
-
         with c_add:
             if st.button("➕ Add / Update Order", use_container_width=True):
                 name = clean_str(order_name) or "Order 1"
                 st.session_state.orders[name] = raw_in
                 clear_results()
                 st.success(f"Saved order: {name}")
-
         with c_clear:
             st.button(
                 "🧹 Clear Paste Box",
@@ -3918,68 +3317,39 @@ with tab_input:
 
         if st.session_state.orders:
             st.markdown("#### Saved Orders")
-
             for saved_name in list(st.session_state.orders.keys()):
                 row_cols = st.columns([4, 1])
-
                 with row_cols[0]:
-                    st.caption(
-                        f"**{saved_name}** — "
-                        f"{len(st.session_state.orders[saved_name].splitlines())} pasted line(s)"
-                    )
-
+                    line_count = len([x for x in st.session_state.orders[saved_name].splitlines() if x.strip()])
+                    st.caption(f"**{saved_name}** — {line_count} pasted line(s)")
                 with row_cols[1]:
-                    if st.button(
-                        "Delete",
-                        key=f"delete_order_{saved_name}",
-                        use_container_width=True,
-                    ):
+                    if st.button("Delete", key=f"delete_order_{saved_name}", use_container_width=True):
                         st.session_state.orders.pop(saved_name, None)
                         clear_results()
                         st.rerun()
 
         process_scope = "ALL ORDERS"
-
         if st.session_state.orders:
-            process_scope = st.selectbox(
-                "Process Scope",
-                ["ALL ORDERS"] + list(st.session_state.orders.keys()),
-            )
+            process_scope = st.selectbox("Process Scope", ["ALL ORDERS"] + list(st.session_state.orders.keys()))
 
         if st.button("Process Manual Orders", type="primary", use_container_width=True):
-            all_rows: List[Dict[str, Any]] = []
-            all_issues: List[ValidationIssue] = []
-
             if not st.session_state.orders:
-                st.error("No orders saved yet.")
+                st.error("No orders saved yet. Click 'Add / Update Order' first.")
             else:
                 if process_scope == "ALL ORDERS":
-                    items_to_process = st.session_state.orders.items()
+                    items_to_process = list(st.session_state.orders.items())
                 else:
-                    items_to_process = [
-                        (
-                            process_scope,
-                            st.session_state.orders.get(process_scope, ""),
-                        )
-                    ]
+                    items_to_process = [(process_scope, st.session_state.orders.get(process_scope, ""))]
 
+                all_rows: List[Dict[str, Any]] = []
+                all_issues: List[ValidationIssue] = []
                 for name, text in items_to_process:
-                    rows, issues = parse_order_text_to_rows(
-                        order_name=name,
-                        raw_text=text,
-                        assumptions=st.session_state.assumptions,
-                    )
+                    rows, issues = parse_order_text_to_rows(name, text, st.session_state.assumptions)
                     all_rows.extend(rows)
                     all_issues.extend(issues)
 
-                st.session_state.df_master = (
-                    pd.DataFrame(all_rows, columns=MASTER_COLUMNS)
-                    if all_rows
-                    else pd.DataFrame(columns=MASTER_COLUMNS)
-                )
-
+                set_master_df(pd.DataFrame(all_rows, columns=MASTER_COLUMNS))
                 st.session_state.last_validation_df = validation_issues_to_df(all_issues)
-                clear_results()
 
                 if all_rows:
                     st.success(f"Loaded {len(all_rows)} unit row(s).")
@@ -3988,87 +3358,55 @@ with tab_input:
 
                 if all_issues:
                     st.warning(f"{len(all_issues)} issue(s) found while parsing.")
-                    st.dataframe(
-                        validation_issues_to_df(all_issues),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-    # ------------------------------------------------------
-    # Excel / CSV upload
-    # ------------------------------------------------------
+                    st.dataframe(validation_issues_to_df(all_issues), use_container_width=True, hide_index=True)
+
     with c_right:
         st.subheader("Excel / CSV Upload")
 
-        upload_order_name = st.text_input(
-            "Order Name for Upload",
-            value="Uploaded Order",
-            key="upload_order_name",
-        )
-
+        upload_order_name = st.text_input("Order Name for Upload", value="Uploaded Order", key="upload_order_name")
         uploaded_file = st.file_uploader(
-            "Upload CSV or Excel",
-            type=["csv", "xlsx", "xlsm", "xls"],
-            key="source_file_upload",
+            "Upload CSV or Excel", type=["csv", "xlsx", "xlsm", "xls"], key="source_file_upload",
         )
 
         if uploaded_file is not None:
             try:
                 uploaded_df = read_uploaded_dataframe(uploaded_file)
-                st.session_state.uploaded_source_df = uploaded_df
-                st.session_state.uploaded_source_name = uploaded_file.name
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Could not read uploaded file: {e}")
+                uploaded_df = None
 
-                st.success(
-                    f"Loaded source file: {uploaded_file.name} "
-                    f"({len(uploaded_df)} row(s))"
-                )
-
-                st.dataframe(
-                    uploaded_df.head(20),
-                    use_container_width=True,
-                )
+            if uploaded_df is not None:
+                st.success(f"Loaded source file: {uploaded_file.name} ({len(uploaded_df)} row(s))")
+                st.dataframe(uploaded_df.head(20), use_container_width=True)
 
                 columns = [str(col) for col in uploaded_df.columns]
+                uploaded_df.columns = columns
                 options = ["<none>"] + columns
                 default_mapping = build_default_column_mapping(columns)
 
                 st.markdown("#### Column Mapping")
-
                 mapping: Dict[str, str] = {}
 
-                def mapping_select(
-                    label: str,
-                    logical_name: str,
-                    required: bool = False,
-                ) -> str:
+                def mapping_select(label: str, logical_name: str, required: bool = False) -> str:
                     default_col = default_mapping.get(logical_name, "<none>")
-                    default_index = (
-                        options.index(default_col)
-                        if default_col in options
-                        else 0
-                    )
-
-                    label_text = f"{label} {'*' if required else ''}"
-
                     return st.selectbox(
-                        label_text,
+                        f"{label}{' *' if required else ''}",
                         options,
-                        index=default_index,
-                        key=f"mapping_{logical_name}",
+                        index=options.index(default_col) if default_col in options else 0,
+                        key=f"mapping_{logical_name}_{uploaded_file.name}",
                     )
 
                 m1, m2 = st.columns(2)
-
                 with m1:
                     mapping["id"] = mapping_select("ID / Mark", "id", True)
-                    mapping["width"] = mapping_select("Width", "width", True)
-                    mapping["height"] = mapping_select("Height", "height", True)
-                    mapping["type"] = mapping_select("Type / System", "type", False)
-
+                    mapping["width"] = mapping_select("Width (in)", "width", True)
+                    mapping["height"] = mapping_select("Height (in)", "height", True)
+                    mapping["type"] = mapping_select("Type / System", "type")
                 with m2:
-                    mapping["qty"] = mapping_select("Quantity", "qty", False)
-                    mapping["depth"] = mapping_select("Depth", "depth", False)
-                    mapping["weight"] = mapping_select("Weight", "weight", False)
-                    mapping["notes"] = mapping_select("Notes", "notes", False)
+                    mapping["qty"] = mapping_select("Quantity", "qty")
+                    mapping["depth"] = mapping_select("Depth (in)", "depth")
+                    mapping["weight"] = mapping_select("Weight (lbs)", "weight")
+                    mapping["notes"] = mapping_select("Notes", "notes")
 
                 import_mode = st.radio(
                     "Import Mode",
@@ -4076,800 +3414,487 @@ with tab_input:
                     horizontal=True,
                 )
 
-                if st.button(
-                    "Import Uploaded File",
-                    type="primary",
-                    use_container_width=True,
-                ):
-                    rows, issues = normalize_uploaded_table(
-                        df=uploaded_df,
-                        order_name=clean_str(upload_order_name) or "Uploaded Order",
-                        mapping=mapping,
-                        assumptions=st.session_state.assumptions,
-                        source_name=uploaded_file.name,
-                    )
-
-                    new_df = (
-                        pd.DataFrame(rows, columns=MASTER_COLUMNS)
-                        if rows
-                        else pd.DataFrame(columns=MASTER_COLUMNS)
-                    )
-
-                    if (
-                        import_mode == "Append to current master table"
-                        and st.session_state.df_master is not None
-                        and not st.session_state.df_master.empty
-                    ):
-                        st.session_state.df_master = pd.concat(
-                            [st.session_state.df_master, new_df],
-                            ignore_index=True,
-                        )
+                if st.button("Import Uploaded File", type="primary", use_container_width=True):
+                    missing = [k for k in ("id", "width", "height") if mapping.get(k, "<none>") == "<none>"]
+                    if missing:
+                        st.error(f"Map the required column(s) first: {', '.join(missing)}")
                     else:
-                        st.session_state.df_master = new_df
-
-                    st.session_state.last_validation_df = validation_issues_to_df(issues)
-                    clear_results()
-
-                    if rows:
-                        st.success(f"Imported {len(rows)} unit row(s).")
-                    else:
-                        st.error("No valid rows imported.")
-
-                    if issues:
-                        st.warning(f"{len(issues)} issue(s) found while importing.")
-                        st.dataframe(
-                            validation_issues_to_df(issues),
-                            use_container_width=True,
-                            hide_index=True,
+                        rows, issues = normalize_uploaded_table(
+                            uploaded_df,
+                            clean_str(upload_order_name) or "Uploaded Order",
+                            mapping,
+                            st.session_state.assumptions,
+                            uploaded_file.name,
                         )
+                        new_df = pd.DataFrame(rows, columns=MASTER_COLUMNS)
 
-            except Exception as e:
-                st.error(f"Could not read uploaded file: {e}")
+                        if import_mode.startswith("Append") and has_master():
+                            new_df = pd.concat([st.session_state.df_master, new_df], ignore_index=True)
 
-    # ------------------------------------------------------
-    # Current master table preview
-    # ------------------------------------------------------
+                        set_master_df(new_df)
+                        st.session_state.last_validation_df = validation_issues_to_df(issues)
+
+                        if rows:
+                            st.success(f"Imported {len(rows)} unit row(s).")
+                        else:
+                            st.error("No valid rows imported.")
+
+                        if issues:
+                            st.warning(f"{len(issues)} issue(s) found while importing.")
+                            st.dataframe(validation_issues_to_df(issues), use_container_width=True, hide_index=True)
+
+                        dupes = validate_master_dataframe(new_df)
+                        if any("Duplicate" in i.problem for i in dupes):
+                            st.warning("Duplicate unit IDs found — use a different order name when appending.")
+
     st.divider()
     st.subheader("Current Master Table Preview")
-
-    if st.session_state.df_master is not None and not st.session_state.df_master.empty:
-        st.dataframe(
-            st.session_state.df_master,
-            use_container_width=True,
-            hide_index=True,
-        )
+    if has_master():
+        st.dataframe(st.session_state.df_master, use_container_width=True, hide_index=True)
     else:
         st.info("No master table loaded yet.")
 
+
 # ==========================================================
-# 24. TAB 2 — EDIT & VALIDATE
+# 23. TAB 2 — EDIT & VALIDATE
 # ==========================================================
 
-with tab_edit:
+def render_tab_edit() -> None:
     st.header("Edit & Validate")
 
-    if st.session_state.df_master is None or st.session_state.df_master.empty:
+    if not has_master():
         st.info("Load data first in the Data Input tab.")
+        return
 
-    else:
-        st.caption(
-            "Edit Mode, Orientation, Split Rows, Split Cols, Depth, and Weight as needed. "
-            "Depth and weight are now used directly in crate and pallet planning."
-        )
+    st.caption(
+        "Edit Mode, Orientation, Split Rows/Cols, Depth and Weight as needed. New rows: enter Order, Mark, W, H "
+        "and Type, then click Save; ID, depth and weight are filled in automatically."
+    )
 
-        current_master = st.session_state.df_master.copy()
+    current_master = st.session_state.df_master.copy()
+    for col in MASTER_COLUMNS:
+        if col not in current_master.columns:
+            current_master[col] = None
+    current_master = current_master[MASTER_COLUMNS]
 
-        # Make sure all expected columns exist.
-        for col in MASTER_COLUMNS:
-            if col not in current_master.columns:
-                current_master[col] = ""
+    edited_df = st.data_editor(
+        current_master,
+        key=f"master_data_editor_{st.session_state.editor_version}",
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "Mode": st.column_config.SelectboxColumn("Mode", options=["WHOLE", "SLANT", "DISASSEMBLED"],
+                                                     default="WHOLE"),
+            "Orient": st.column_config.SelectboxColumn("Orientation", options=["AUTO", "UPRIGHT", "SIDE"],
+                                                       default="AUTO"),
+            "SR": st.column_config.NumberColumn("Split Rows", min_value=1, step=1, default=1),
+            "SC": st.column_config.NumberColumn("Split Cols", min_value=1, step=1, default=1),
+            "W": st.column_config.NumberColumn("Width", min_value=0.01, step=0.125, format="%.3f"),
+            "H": st.column_config.NumberColumn("Height", min_value=0.01, step=0.125, format="%.3f"),
+            "Depth": st.column_config.NumberColumn("Depth", min_value=0.01, step=0.01, format="%.3f"),
+            "Lbs": st.column_config.NumberColumn("Weight Lbs", min_value=0.01, step=1.0, format="%.1f"),
+            "Qty": st.column_config.NumberColumn("Qty", disabled=True),
+        },
+        disabled=["ID", "Orig", "Source", "Qty"],
+    )
 
-        current_master = current_master[MASTER_COLUMNS]
+    normalized_edit = normalize_master_df(edited_df, st.session_state.assumptions)
 
-        edited_df = st.data_editor(
-            current_master,
-            key="master_data_editor",
-            use_container_width=True,
-            hide_index=True,
-            num_rows="dynamic",
-            column_config={
-                "Mode": st.column_config.SelectboxColumn(
-                    "Mode",
-                    options=["WHOLE", "SLANT", "DISASSEMBLED"],
-                    required=True,
-                ),
-                "Orient": st.column_config.SelectboxColumn(
-                    "Orientation",
-                    options=["AUTO", "UPRIGHT", "SIDE"],
-                    required=True,
-                ),
-                "SR": st.column_config.NumberColumn(
-                    "Split Rows",
-                    min_value=1,
-                    step=1,
-                ),
-                "SC": st.column_config.NumberColumn(
-                    "Split Cols",
-                    min_value=1,
-                    step=1,
-                ),
-                "W": st.column_config.NumberColumn(
-                    "Width",
-                    min_value=0.01,
-                    step=0.125,
-                    format="%.3f",
-                ),
-                "H": st.column_config.NumberColumn(
-                    "Height",
-                    min_value=0.01,
-                    step=0.125,
-                    format="%.3f",
-                ),
-                "Depth": st.column_config.NumberColumn(
-                    "Depth",
-                    min_value=0.01,
-                    step=0.01,
-                    format="%.3f",
-                ),
-                "Lbs": st.column_config.NumberColumn(
-                    "Weight Lbs",
-                    min_value=0.01,
-                    step=1.0,
-                    format="%.1f",
-                ),
-                "Qty": st.column_config.NumberColumn(
-                    "Qty",
-                    disabled=True,
-                ),
-            },
-            disabled=[
-                "ID",
-                "Orig",
-                "Source",
-            ],
-        )
+    c_save, c_validate, c_clear = st.columns(3)
 
-        c_save, c_recalc, c_clear = st.columns([1, 1, 1])
-
-        with c_save:
-            if st.button(
-                "💾 Save Edited Master Table",
-                type="primary",
-                use_container_width=True,
-            ):
-                st.session_state.df_master = edited_df.copy()
-                clear_results()
-                st.success("Edited master table saved.")
-
-        with c_recalc:
-            if st.button(
-                "🔎 Validate Current Table",
-                use_container_width=True,
-            ):
-                st.session_state.df_master = edited_df.copy()
-
-                validation_issues = validate_master_dataframe(
-                    st.session_state.df_master
-                )
-
-                st.session_state.last_validation_df = validation_issues_to_df(
-                    validation_issues
-                )
-
-                selected_vehicle_name = st.session_state.selected_vehicle
-                vehicle_data_now = st.session_state.vehicle_catalog[selected_vehicle_name]
-
-                st.session_state.unit_issue_df = build_unit_issue_report(
-                    st.session_state.df_master,
-                    vehicle_data_now,
-                    st.session_state.assumptions,
-                )
-
-                clear_results()
-                st.success("Validation complete.")
-
-        with c_clear:
-            if st.button(
-                "🧹 Clear Master Table",
-                use_container_width=True,
-            ):
-                st.session_state.df_master = pd.DataFrame(columns=MASTER_COLUMNS)
-                st.session_state.last_validation_df = pd.DataFrame()
-                st.session_state.unit_issue_df = pd.DataFrame()
-                clear_results()
-                st.rerun()
-
-        st.divider()
-
-        st.subheader("Validation Issues")
-
-        if (
-            st.session_state.last_validation_df is not None
-            and not st.session_state.last_validation_df.empty
-        ):
-            st.dataframe(
-                st.session_state.last_validation_df,
-                use_container_width=True,
-                hide_index=True,
+    with c_save:
+        if st.button("💾 Save Edited Master Table", type="primary", use_container_width=True):
+            set_master_df(normalized_edit)
+            st.session_state.last_validation_df = validation_issues_to_df(
+                validate_master_dataframe(normalized_edit)
             )
-        else:
-            st.success("No parsing/master-table validation issues currently stored.")
+            st.rerun()
 
-        st.divider()
+    with c_validate:
+        if st.button("🔎 Validate Current Edits", use_container_width=True):
+            st.session_state.last_validation_df = validation_issues_to_df(
+                validate_master_dataframe(normalized_edit)
+            )
+            st.success("Validation complete. Save to keep the edits.")
 
-        st.subheader("Practical Fit / Oversized Unit Report")
+    with c_clear:
+        if st.button("🧹 Clear Master Table", use_container_width=True):
+            set_master_df(pd.DataFrame(columns=MASTER_COLUMNS))
+            st.session_state.last_validation_df = pd.DataFrame()
+            st.session_state.unit_issue_df = pd.DataFrame()
+            st.rerun()
 
-        selected_vehicle_name = st.session_state.selected_vehicle
-        vehicle_data_now = st.session_state.vehicle_catalog[selected_vehicle_name]
+    st.divider()
+    st.subheader("Validation Issues")
+    if st.session_state.last_validation_df is not None and not st.session_state.last_validation_df.empty:
+        st.dataframe(st.session_state.last_validation_df, use_container_width=True, hide_index=True)
+    else:
+        st.success("No parsing/master-table validation issues currently stored.")
 
-        issue_df_preview = build_unit_issue_report(
-            edited_df,
-            vehicle_data_now,
-            st.session_state.assumptions,
-        )
+    st.divider()
+    st.subheader("Factory Transport Check (current edits)")
 
-        st.session_state.unit_issue_df = issue_df_preview
+    vehicle_data = st.session_state.vehicle_catalog[st.session_state.selected_vehicle]
+    issue_df = build_unit_issue_report(normalized_edit, vehicle_data, st.session_state.assumptions)
+    st.session_state.unit_issue_df = issue_df
+    show_issue_summary(issue_df)
 
-        show_issue_summary(issue_df_preview)
+    st.caption(
+        "Based on the selected vehicle's door height and the factory transport rules in the sidebar. "
+        "Changing the vehicle or rules can change the result."
+    )
 
-        st.caption(
-            "This report is based on the currently selected vehicle and height clearance. "
-            "Changing the vehicle can change which units are considered problematic."
-        )
+
 # ==========================================================
-# 25. TAB 3 — OPTIMIZE
+# 24. TAB 3 — OPTIMIZE
 # ==========================================================
 
-with tab_optimize:
+def render_result_metrics(result: Dict[str, Any]) -> None:
+    manifest_df = result["manifest_df"]
+    loads = result["loads"]
+    counts = plan_class_counts(result)
+
+    total_weight = float(manifest_df["Weight"].astype(float).sum()) if not manifest_df.empty else 0.0
+    avg_util = sum(float(ld["util"]) for ld in loads) / len(loads) if loads else 0.0
+
+    m = st.columns(6)
+    m[0].metric("Total Weight", pounds_text(total_weight))
+    m[1].metric("Containers", len(loads))
+    m[2].metric("Crates / Racks", len(result["crates"]))
+    m[3].metric("Pallets", len(result["pallets"]))
+    m[4].metric("Avg Floor Util", f"{avg_util:.1f}%")
+    m[5].metric("Unpacked", len(result["final_overflow"]))
+
+    n = st.columns(5)
+    n[0].metric("Standard pieces", counts.get(CLASS_STD, 0))
+    n[1].metric("Low-floor (no glass)", counts.get(CLASS_LOW, 0))
+    n[2].metric("Slant rack", counts.get(CLASS_SLANT, 0))
+    n[3].metric("Disassembled parts", counts.get(CLASS_DIS, 0))
+    n[4].metric("Oversize", counts.get(CLASS_OVERSIZE, 0))
+
+
+def render_tab_optimize() -> None:
     st.header("Optimize Load Plan")
 
-    if st.session_state.df_master is None or st.session_state.df_master.empty:
+    if not has_master():
         st.info("Load and validate data first.")
+        return
 
-    else:
-        selected_vehicle_name = st.session_state.selected_vehicle
-        vehicle_data_now = st.session_state.vehicle_catalog[selected_vehicle_name]
-        assumptions_now = st.session_state.assumptions
+    vehicle_name = st.session_state.selected_vehicle
+    vehicle_data = st.session_state.vehicle_catalog[vehicle_name]
+    assumptions = st.session_state.assumptions
+    lim = current_limits()
 
-        max_h_int_now = get_vehicle_internal_crate_height_limit(
-            vehicle_data_now,
-            assumptions_now.vehicle_height_clearance,
+    c = st.columns(5)
+    c[0].metric("Vehicle", vehicle_name)
+    c[1].metric("Loading Height Limit", inches_text(lim.vehicle_limit_h))
+    c[2].metric("Std Pallet Unit Max", f"{in_to_mm(lim.std_max_v):,.0f} mm")
+    c[3].metric("Low-Floor Unit Max", f"{in_to_mm(lim.low_floor_max_v):,.0f} mm")
+    c[4].metric("Slant Unit Max", f"{in_to_mm(lim.slant_max_v):,.0f} mm")
+
+    st.warning(assumptions.planning_warning)
+
+    st.subheader("Pre-Optimization Checks")
+    validation_issues = validate_master_dataframe(normalize_master_df(st.session_state.df_master, assumptions))
+    validation_df = validation_issues_to_df(validation_issues)
+
+    if not validation_df.empty:
+        st.markdown("#### Master Table Validation")
+        st.dataframe(validation_df, use_container_width=True, hide_index=True)
+
+    unit_issue_df = build_unit_issue_report(st.session_state.df_master, vehicle_data, assumptions)
+    st.markdown("#### Factory Transport Check")
+    show_issue_summary(unit_issue_df)
+
+    blocking = any(issue.severity == "ERROR" for issue in validation_issues)
+    if blocking:
+        st.error("Fix validation errors before optimizing.")
+
+    st.divider()
+    c_opt, c_reset = st.columns([2, 1])
+    with c_opt:
+        optimize_clicked = st.button("🚀 Optimize Load", type="primary", use_container_width=True, disabled=blocking)
+    with c_reset:
+        if st.button("Clear Results", use_container_width=True):
+            clear_results()
+            st.success("Results cleared.")
+
+    if optimize_clicked:
+        plan = build_logistics_plan(
+            st.session_state.df_master, vehicle_name, vehicle_data,
+            st.session_state.selected_pallets, st.session_state.pallet_catalog, assumptions,
         )
+        if not plan.get("ok"):
+            st.session_state.results = None
+            st.error(plan.get("message", "Optimization failed."))
+            if "errors" in plan:
+                st.dataframe(plan["errors"], use_container_width=True, hide_index=True)
+        else:
+            st.session_state.results = plan
+            st.session_state.unit_issue_df = unit_issue_df
+            st.success("Optimization complete.")
 
-        max_h_ext_now = get_vehicle_external_crate_height_limit(
-            vehicle_data_now,
-            assumptions_now.vehicle_height_clearance,
-        )
+    st.divider()
 
-        c1, c2, c3, c4 = st.columns(4)
+    result = st.session_state.results
+    if not result:
+        return
 
-        c1.metric("Vehicle", selected_vehicle_name)
-        c2.metric("Vehicle Height", inches_text(float(vehicle_data_now["H"])))
-        c3.metric("Usable Crate Internal H", inches_text(max_h_int_now))
-        c4.metric("Max Crate External H", inches_text(max_h_ext_now))
+    render_result_metrics(result)
 
-        st.warning(assumptions_now.planning_warning)
+    if result["final_overflow"]:
+        st.error(f"{len(result['final_overflow'])} package(s) could not be loaded into the selected vehicle.")
+        st.dataframe(pd.DataFrame(result["final_overflow"]), use_container_width=True, hide_index=True)
 
-        st.subheader("Pre-Optimization Checks")
+    manifest_df = result["manifest_df"]
+    if not manifest_df.empty:
+        bad = manifest_df[manifest_df["Status"].astype(str) != "OK"]
+        if not bad.empty:
+            st.warning(f"{len(bad)} package(s) have status warnings.")
+            st.dataframe(bad, use_container_width=True, hide_index=True)
 
-        validation_issues = validate_master_dataframe(st.session_state.df_master)
-        validation_df = validation_issues_to_df(validation_issues)
+    st.subheader("Container Load Summary")
+    st.dataframe(result["load_summary_df"], use_container_width=True, hide_index=True)
 
-        unit_issue_df = build_unit_issue_report(
-            st.session_state.df_master,
-            vehicle_data_now,
-            assumptions_now,
-        )
-
-        if not validation_df.empty:
-            st.markdown("#### Master Table Validation")
-            st.dataframe(
-                validation_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.markdown("#### Practical Fit Issues")
-        show_issue_summary(unit_issue_df)
-
-        blocking_errors = [
-            issue
-            for issue in validation_issues
-            if issue.severity == "ERROR"
-        ]
-
-        if blocking_errors:
-            st.error("Fix validation errors before optimizing.")
-
-        st.divider()
-
-        c_opt, c_reset = st.columns([2, 1])
-
-        with c_opt:
-            optimize_clicked = st.button(
-                "🚀 Optimize Load",
-                type="primary",
-                use_container_width=True,
-                disabled=bool(blocking_errors),
-            )
-
-        with c_reset:
-            if st.button("Clear Results", use_container_width=True):
-                clear_results()
-                st.success("Results cleared.")
-
-        if optimize_clicked:
-            plan = build_logistics_plan(
-                master_df=st.session_state.df_master,
-                vehicle_name=selected_vehicle_name,
-                vehicle_data=vehicle_data_now,
-                selected_pallet_names=st.session_state.selected_pallets,
-                pallet_catalog=st.session_state.pallet_catalog,
-                assumptions=assumptions_now,
-            )
-
-            if not plan.get("ok"):
-                st.session_state.results = None
-                st.error(plan.get("message", "Optimization failed."))
-
-                if "errors" in plan:
-                    st.dataframe(
-                        plan["errors"],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-            else:
-                st.session_state.results = plan
-                st.session_state.unit_issue_df = unit_issue_df
-                st.success("Optimization complete.")
-
-        st.divider()
-
-        if st.session_state.results:
-            result = st.session_state.results
-
-            manifest_df = result["manifest_df"]
-            load_summary_df = result["load_summary_df"]
-            final_overflow = result["final_overflow"]
-
-            total_weight = 0.0
-            if manifest_df is not None and not manifest_df.empty:
-                total_weight = float(manifest_df["Weight"].astype(float).sum())
-
-            loads = result["loads"]
-            avg_util = 0.0
-            if loads:
-                avg_util = sum(float(load["util"]) for load in loads) / len(loads)
-
-            m1, m2, m3, m4, m5 = st.columns(5)
-
-            m1.metric("Total Weight", pounds_text(total_weight))
-            m2.metric("Containers Used", len(loads))
-            m3.metric("Crates", len(result["crates"]))
-            m4.metric("Pallets", len(result["pallets"]))
-            m5.metric("Avg Floor Util", f"{avg_util:.1f}%")
-
-            if final_overflow:
-                st.error(
-                    f"{len(final_overflow)} package(s) could not be packed into the selected vehicle."
-                )
-                st.dataframe(
-                    pd.DataFrame(final_overflow),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            overloaded_loads = [
-                load
-                for load in loads
-                if load.get("payload_over")
-            ]
-
-            if overloaded_loads:
-                st.warning(
-                    f"{len(overloaded_loads)} container(s) exceed configured payload limit."
-                )
-
-            bad_packages = pd.DataFrame()
-
-            if manifest_df is not None and not manifest_df.empty:
-                bad_packages = manifest_df[
-                    manifest_df["Status"].astype(str) != "OK"
-                ]
-
-            if not bad_packages.empty:
-                st.warning(
-                    f"{len(bad_packages)} package(s) have crate/pallet status warnings."
-                )
-                st.dataframe(
-                    bad_packages,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-            st.subheader("Container Load Summary")
-            st.dataframe(
-                load_summary_df,
-                use_container_width=True,
-                hide_index=True,
-            )
 
 # ==========================================================
-# 26. TAB 4 — RESULTS & EXPORT
+# 25. TAB 4 — RESULTS & EXPORT
 # ==========================================================
 
-with tab_results:
+def render_tab_results() -> None:
     st.header("Results & Export")
 
-    if not st.session_state.results:
+    result = st.session_state.results
+    if not result:
         st.info("Run optimization first.")
+        return
 
-    else:
-        result = st.session_state.results
+    render_result_metrics(result)
+    st.warning(result["assumptions"].planning_warning)
+    st.divider()
 
-        manifest_df = result["manifest_df"]
-        load_summary_df = result["load_summary_df"]
-        decision_df = result["decision_df"]
-        packing_notes_df = result["packing_notes_df"]
-        loads = result["loads"]
-        order_color_map = result["order_color_map"]
-        vehicle_data_now = result["vehicle_data"]
-        vehicle_name_now = result["vehicle_name"]
+    st.subheader("Package Manifest")
+    st.dataframe(result["manifest_df"], use_container_width=True, hide_index=True)
 
-        total_weight = 0.0
-        if manifest_df is not None and not manifest_df.empty:
-            total_weight = float(manifest_df["Weight"].astype(float).sum())
+    st.subheader("Container Load Summary")
+    st.dataframe(result["load_summary_df"], use_container_width=True, hide_index=True)
 
-        avg_util = 0.0
-        if loads:
-            avg_util = sum(float(load["util"]) for load in loads) / len(loads)
+    st.subheader("Packing Decisions")
+    st.dataframe(result["decision_df"], use_container_width=True, hide_index=True)
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+    if result["packing_notes_df"] is not None and not result["packing_notes_df"].empty:
+        with st.expander("Packing Notes", expanded=False):
+            st.dataframe(result["packing_notes_df"], use_container_width=True, hide_index=True)
 
-        c1.metric("Total Weight", pounds_text(total_weight))
-        c2.metric("Containers Used", len(loads))
-        c3.metric("Crates", len(result["crates"]))
-        c4.metric("Pallets", len(result["pallets"]))
-        c5.metric("Avg Floor Util", f"{avg_util:.1f}%")
+    st.divider()
+    st.subheader("Container Plans")
 
-        st.warning(result["assumptions"].planning_warning)
+    loads = result["loads"]
+    vehicle_data = result["vehicle_data"]
 
-        st.divider()
+    if loads:
+        selected_no = st.selectbox(
+            "View Container", [load["container_no"] for load in loads], key="results_container_select",
+        )
+        selected_load = next(load for load in loads if load["container_no"] == selected_no)
 
-        st.subheader("Package Manifest")
-        st.dataframe(
-            manifest_df,
+        st.caption(
+            f"{result['vehicle_name']} — Container #{selected_no} — "
+            f"Utilization: {selected_load['util']:.1f}% — "
+            f"Weight: {pounds_text(float(selected_load.get('weight', 0)))}"
+        )
+
+        st.plotly_chart(
+            build_2d_plan(
+                selected_load["placed"], float(vehicle_data["L"]), float(vehicle_data["W"]),
+                result["order_color_map"], title_text=f"Container #{selected_no} 2D Plan",
+            ),
             use_container_width=True,
-            hide_index=True,
+            key=f"plan2d_{selected_no}",
         )
-
-        st.subheader("Container Load Summary")
-        st.dataframe(
-            load_summary_df,
+        st.plotly_chart(
+            build_3d_plan(selected_load, result, vehicle_data, result["order_color_map"]),
             use_container_width=True,
-            hide_index=True,
+            key=f"plan3d_{selected_no}",
         )
 
-        st.subheader("Packing Decisions")
-        st.dataframe(
-            decision_df,
-            use_container_width=True,
-            hide_index=True,
-        )
+    if result.get("final_overflow"):
+        st.subheader("Unpacked Packages")
+        st.error(f"{len(result['final_overflow'])} package(s) could not be loaded.")
+        st.dataframe(pd.DataFrame(result["final_overflow"]), use_container_width=True, hide_index=True)
 
-        if packing_notes_df is not None and not packing_notes_df.empty:
-            st.subheader("Packing Notes")
-            st.dataframe(
-                packing_notes_df,
-                use_container_width=True,
-                hide_index=True,
-            )
+    st.divider()
+    st.subheader("Exports")
 
-        st.divider()
+    base_name = f"{today_file_stamp()}-{slugify(st.session_state.project.display_name())}-logistics-manifest"
+    col_pdf, col_xlsx, col_json = st.columns(3)
 
-        st.subheader("Container Plans")
-
-        if loads:
-            selected_container_no = st.selectbox(
-                "View Container",
-                [load["container_no"] for load in loads],
-                key="results_container_select",
-            )
-
-            selected_load = next(
-                load
-                for load in loads
-                if load["container_no"] == selected_container_no
-            )
-
-            st.caption(
-                f"{vehicle_name_now} — Container #{selected_container_no} — "
-                f"Utilization: {selected_load['util']:.1f}% — "
-                f"Weight: {pounds_text(float(selected_load.get('weight', 0)))}"
-            )
-
-            if selected_load.get("payload_over"):
-                st.warning("This container exceeds the configured payload limit.")
-
-            container_L = float(vehicle_data_now["L"])
-            container_W = float(vehicle_data_now["W"])
-
-            fig2d = build_2d_plan(
-                selected_load["placed"],
-                container_L,
-                container_W,
-                order_color_map,
-                title_text=f"Container #{selected_container_no} 2D Plan",
-            )
-
-            st.plotly_chart(fig2d, use_container_width=True)
-
-            fig3d = build_3d_plan(
-                selected_load,
-                result,
-                vehicle_data_now,
-                order_color_map,
-            )
-
-            st.plotly_chart(fig3d, use_container_width=True)
-
-        final_overflow = result.get("final_overflow", [])
-
-        if final_overflow:
-            st.subheader("Unpacked / Overflow Items")
-            st.error(
-                f"{len(final_overflow)} package(s) could not be packed into any selected vehicle load."
-            )
-            st.dataframe(
-                pd.DataFrame(final_overflow),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        st.divider()
-
-        st.subheader("Exports")
-
-        export_base_name = (
-            f"{today_file_stamp()}-"
-            f"{slugify(st.session_state.project.display_name())}-"
-            f"logistics-manifest"
-        )
-
-        col_pdf, col_xlsx, col_json = st.columns(3)
-
-        with col_pdf:
-            try:
-                pdf_bytes = generate_pdf_report(
-                    st.session_state.project,
-                    result,
-                )
-
-                st.download_button(
-                    "Download PDF Manifest",
-                    data=pdf_bytes,
-                    file_name=f"{export_base_name}.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-
-            except Exception as e:
-                st.error(f"Could not generate PDF: {e}")
-
-        with col_xlsx:
-            try:
-                excel_bytes = export_plan_to_excel_bytes(
-                    project=st.session_state.project,
-                    master_df=st.session_state.df_master,
-                    unit_issue_df=st.session_state.unit_issue_df,
-                    result=result,
-                    scenario_df=st.session_state.scenario_df,
-                )
-
-                st.download_button(
-                    "Download Excel Workbook",
-                    data=excel_bytes,
-                    file_name=f"{export_base_name}.xlsx",
-                    mime=(
-                        "application/vnd.openxmlformats-officedocument."
-                        "spreadsheetml.sheet"
-                    ),
-                    use_container_width=True,
-                )
-
-            except Exception as e:
-                st.error(f"Could not generate Excel workbook: {e}")
-
-        with col_json:
-            save_payload = build_job_save_payload(
-                project=st.session_state.project,
-                assumptions=st.session_state.assumptions,
-                orders=st.session_state.orders,
-                master_df=st.session_state.df_master,
-                selected_vehicle=st.session_state.selected_vehicle,
-                selected_pallets=st.session_state.selected_pallets,
-            )
-
+    with col_pdf:
+        try:
             st.download_button(
-                "Download Job JSON",
-                data=json_download_bytes(save_payload),
-                file_name=f"{export_base_name}.json",
-                mime="application/json",
+                "Download PDF Manifest",
+                data=generate_pdf_report(st.session_state.project, result),
+                file_name=f"{base_name}.pdf",
+                mime="application/pdf",
                 use_container_width=True,
+                key="results_pdf_download",
             )
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not generate PDF: {e}")
+
+    with col_xlsx:
+        try:
+            st.download_button(
+                "Download Excel Workbook",
+                data=export_plan_to_excel_bytes(
+                    st.session_state.project, st.session_state.df_master, st.session_state.unit_issue_df,
+                    result, st.session_state.scenario_df,
+                ),
+                file_name=f"{base_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="results_xlsx_download",
+            )
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not generate Excel workbook: {e}")
+
+    with col_json:
+        st.download_button(
+            "Download Job JSON",
+            data=json_download_bytes(
+                build_job_save_payload(
+                    st.session_state.project, st.session_state.assumptions, st.session_state.orders,
+                    st.session_state.df_master, st.session_state.selected_vehicle,
+                    st.session_state.selected_pallets,
+                )
+            ),
+            file_name=f"{base_name}.json",
+            mime="application/json",
+            use_container_width=True,
+            key="results_json_download",
+        )
+
 
 # ==========================================================
-# 27. TAB 5 — SCENARIOS
+# 26. TAB 5 — SCENARIOS
 # ==========================================================
 
-with tab_scenarios:
+def render_tab_scenarios() -> None:
     st.header("Scenario Comparison")
 
-    if st.session_state.df_master is None or st.session_state.df_master.empty:
+    if not has_master():
         st.info("Load unit data first.")
+        return
 
-    else:
-        st.caption(
-            "Compare different vehicles and handling strategies before committing "
-            "to the final optimized plan."
-        )
+    st.caption("Compare vehicles and handling strategies before committing to the final plan.")
 
-        vehicle_options = list(st.session_state.vehicle_catalog.keys())
+    selected_vehicle_names = st.multiselect(
+        "Vehicles to Compare",
+        list(st.session_state.vehicle_catalog.keys()),
+        default=[st.session_state.selected_vehicle],
+    )
+    selected_strategy_names = st.multiselect(
+        "Strategies to Compare",
+        SCENARIO_OPTIONS,
+        default=SCENARIO_OPTIONS,
+        help=(
+            "Strategies only change units that do not fit a standard pallet as currently set, "
+            "and never override a split you entered yourself."
+        ),
+    )
 
-        default_vehicle_compare = [
-            st.session_state.selected_vehicle
-        ]
+    st.caption(
+        "Scenario comparison is a planning aid. It does not replace final review of handling rules, "
+        "crate construction, carrier requirements, or factory packing constraints."
+    )
 
-        selected_vehicle_names = st.multiselect(
-            "Vehicles to Compare",
-            vehicle_options,
-            default=default_vehicle_compare,
-        )
-
-        strategy_options = [
-            "Current Settings",
-            "Auto Slant Tall Units",
-            "Disassemble Oversized Units",
-            "Split Oversized Units 2x1",
-        ]
-
-        selected_strategy_names = st.multiselect(
-            "Strategies to Compare",
-            strategy_options,
-            default=[
-                "Current Settings",
-                "Auto Slant Tall Units",
-                "Disassemble Oversized Units",
-            ],
-        )
-
-        st.caption(
-            "Scenario comparison is a planning aid. It does not replace final review "
-            "of handling rules, crate construction, carrier requirements, or shop/factory packing constraints."
-        )
-
-        run_scenarios_clicked = st.button(
-            "Run Scenario Comparison",
-            type="primary",
-            use_container_width=True,
-        )
-
-        if run_scenarios_clicked:
-            if not selected_vehicle_names:
-                st.error("Select at least one vehicle.")
-
-            elif not selected_strategy_names:
-                st.error("Select at least one strategy.")
-
-            else:
-                scenario_df = run_scenario_comparison(
-                    master_df=st.session_state.df_master,
-                    vehicle_catalog=st.session_state.vehicle_catalog,
-                    selected_vehicle_names=selected_vehicle_names,
-                    selected_pallet_names=st.session_state.selected_pallets,
-                    pallet_catalog=st.session_state.pallet_catalog,
-                    assumptions=st.session_state.assumptions,
-                    selected_strategy_names=selected_strategy_names,
-                )
-
-                st.session_state.scenario_df = scenario_df
-
-                st.success("Scenario comparison complete.")
-
-        if (
-            st.session_state.scenario_df is not None
-            and not st.session_state.scenario_df.empty
-        ):
-            st.subheader("Scenario Results")
-
-            st.dataframe(
-                st.session_state.scenario_df,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.markdown("#### Best-Looking Options")
-
-            scenario_df = st.session_state.scenario_df.copy()
-
-            usable = scenario_df[
-                scenario_df["Status"].isin(["OK", "REVIEW"])
-            ].copy()
-
-            if usable.empty:
-                st.warning("No usable scenario results found.")
-
-            else:
-                usable["Containers"] = pd.to_numeric(
-                    usable["Containers"],
-                    errors="coerce",
-                )
-
-                usable["Unpacked Items"] = pd.to_numeric(
-                    usable["Unpacked Items"],
-                    errors="coerce",
-                )
-
-                usable["Avg Floor Util %"] = pd.to_numeric(
-                    usable["Avg Floor Util %"],
-                    errors="coerce",
-                )
-
-                usable = usable.sort_values(
-                    by=[
-                        "Unpacked Items",
-                        "Containers",
-                        "Status",
-                        "Avg Floor Util %",
-                    ],
-                    ascending=[
-                        True,
-                        True,
-                        True,
-                        False,
-                    ],
-                )
-
-                st.dataframe(
-                    usable.head(10),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-        st.divider()
-
-        st.subheader("Scenario Export")
-
-        if (
-            st.session_state.scenario_df is not None
-            and not st.session_state.scenario_df.empty
-        ):
-            scenario_export_name = (
-                f"{today_file_stamp()}-"
-                f"{slugify(st.session_state.project.display_name())}-"
-                f"scenario-comparison.csv"
-            )
-
-            st.download_button(
-                "Download Scenario CSV",
-                data=st.session_state.scenario_df.to_csv(index=False).encode("utf-8"),
-                file_name=scenario_export_name,
-                mime="text/csv",
-                use_container_width=True,
-            )
-
+    if st.button("Run Scenario Comparison", type="primary", use_container_width=True):
+        if not selected_vehicle_names:
+            st.error("Select at least one vehicle.")
+        elif not selected_strategy_names:
+            st.error("Select at least one strategy.")
         else:
-            st.info("Run a scenario comparison to enable scenario export.")
+            st.session_state.scenario_df = run_scenario_comparison(
+                st.session_state.df_master,
+                st.session_state.vehicle_catalog,
+                selected_vehicle_names,
+                st.session_state.selected_pallets,
+                st.session_state.pallet_catalog,
+                st.session_state.assumptions,
+                selected_strategy_names,
+            )
+            st.success("Scenario comparison complete.")
+
+    scenario_df = st.session_state.scenario_df
+    if scenario_df is None or scenario_df.empty:
+        st.info("Run a scenario comparison to see results and enable export.")
+        return
+
+    st.subheader("Scenario Results")
+    st.dataframe(scenario_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Best-Looking Options")
+    usable = scenario_df[scenario_df["Status"] != "ERROR"].copy()
+
+    if usable.empty:
+        st.warning("No usable scenario results found.")
+    else:
+        status_rank = {"OK": 0, "OK - RESTRICTIONS": 1, "REVIEW": 2}
+        usable["_status_rank"] = usable["Status"].map(status_rank).fillna(3)
+        for col in ["Containers", "Unpacked Items", "Avg Floor Util %", "Low-Floor Pieces (no glass)"]:
+            usable[col] = pd.to_numeric(usable[col], errors="coerce")
+
+        usable = usable.sort_values(
+            by=["Unpacked Items", "_status_rank", "Containers", "Low-Floor Pieces (no glass)", "Avg Floor Util %"],
+            ascending=[True, True, True, True, False],
+        ).drop(columns=["_status_rank"])
+
+        st.dataframe(usable.head(10), use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "Download Scenario CSV",
+        data=scenario_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{today_file_stamp()}-{slugify(st.session_state.project.display_name())}-scenario-comparison.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="scenario_csv_download",
+    )
+
 
 # ==========================================================
-# 28. FOOTER
+# 27. MAIN
 # ==========================================================
 
-st.divider()
+def main() -> None:
+    st.set_page_config(page_title=APP_NAME, layout="wide")
+    init_session_state()
+    check_password()
 
-st.caption(
-    "UltraLogistics Pro — planning tool only. "
-    "Final crate design, glass handling, blocking/bracing, freight loading, "
-    "payload, route restrictions, and carrier requirements must be verified before shipment."
-)
+    st.title(f"🚚 {APP_NAME}")
+    render_sidebar()
+
+    tab_input, tab_edit, tab_optimize, tab_results, tab_scenarios = st.tabs(
+        ["1️⃣ Data Input", "2️⃣ Edit & Validate", "3️⃣ Optimize", "4️⃣ Results & Export", "5️⃣ Scenarios"]
+    )
+
+    with tab_input:
+        render_tab_input()
+    with tab_edit:
+        render_tab_edit()
+    with tab_optimize:
+        render_tab_optimize()
+    with tab_results:
+        render_tab_results()
+    with tab_scenarios:
+        render_tab_scenarios()
+
+    st.divider()
+    st.caption(
+        f"{APP_NAME} {APP_VERSION} — planning tool only. Final crate design, glass handling, blocking/bracing, "
+        "freight loading, payload, route restrictions, and carrier requirements must be verified before shipment."
+    )
+
+
+if __name__ == "__main__":
+    main()
