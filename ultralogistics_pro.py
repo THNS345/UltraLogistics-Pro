@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
+import html as _html
 import json
 import math
+import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
@@ -48,7 +51,7 @@ import ui_theme as ui  # Apple-style look (same theme as the EAS Estimating Tool
 # ==========================================================
 
 APP_NAME = "UltraLogistics Pro"
-APP_VERSION = "2026-11-03"
+APP_VERSION = "2026-11-03 guided"
 
 
 # ==========================================================
@@ -2841,9 +2844,10 @@ def build_job_save_payload(
     master_df: Optional[pd.DataFrame],
     selected_vehicle: str,
     selected_pallets: List[str],
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     records = master_df.to_dict(orient="records") if master_df is not None and not master_df.empty else []
-    return {
+    payload = {
         "app": APP_NAME,
         "version": APP_VERSION,
         "saved_at": now_stamp(),
@@ -2854,6 +2858,9 @@ def build_job_save_payload(
         "selected_vehicle": selected_vehicle,
         "selected_pallets": selected_pallets,
     }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def load_job_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2879,6 +2886,9 @@ def load_job_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "master_df": master_df,
         "selected_vehicle": clean_str(payload.get("selected_vehicle")),
         "selected_pallets": selected_pallets,
+        "decided": payload.get("decided") if isinstance(payload.get("decided"), dict) else {},
+        "step": safe_int(payload.get("step"), 0) or 0,
+        "job_id": clean_str(payload.get("job_id")),
     }
 
 
@@ -2960,8 +2970,22 @@ def merge_custom_config(
 
 
 # ==========================================================
-# 19. STREAMLIT SESSION STATE
+# 19. SESSION STATE, JOB STORE
+#
+# The app is a guided workflow: Jobs -> 1 Job -> 2 Units -> 3 Review -> 4 Plan.
+# Every job is saved as a JSON file per user, so several jobs can be open over time.
+# Decisions made in Review are written back into the master table
+# (Mode / Orient / SR / SC), so the optimizer logic is unchanged.
 # ==========================================================
+
+STEPS = ["Job", "Units", "Review", "Plan"]
+STEP_LABELS = [f"{i + 1}  {name}" for i, name in enumerate(STEPS)]
+
+OPT_SLANT = "slant"
+OPT_LOW = "low"
+OPT_DIS = "disassemble"
+OPT_SPLIT = "split"
+
 
 def init_session_state() -> None:
     defaults = {
@@ -2970,14 +2994,25 @@ def init_session_state() -> None:
         "orders": {},
         "df_master": None,
         "results": None,
+        "results_key": "",
         "unit_issue_df": pd.DataFrame(),
         "scenario_df": pd.DataFrame(),
         "vehicle_catalog": DEFAULT_CONTAINERS,
         "pallet_catalog": DEFAULT_PALLETS,
+        "custom_config": None,
         "selected_vehicle": "40' HC Container",
         "selected_pallets": ["Euro 2 (1200x1000mm)", "Factory (2200x1000mm)"],
         "last_validation_df": pd.DataFrame(),
         "editor_version": 0,
+        "job_id": None,
+        "step": 0,
+        "step_ctl": STEP_LABELS[0],
+        "decided": {},
+        "selected_order": "",
+        "order_issues": {},
+        "confirm_delete": "",
+        "last_saved_hash": "",
+        "export_cache": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -2986,14 +3021,43 @@ def init_session_state() -> None:
 
 def clear_results() -> None:
     st.session_state.results = None
+    st.session_state.results_key = ""
+    st.session_state.export_cache = None
     st.session_state.scenario_df = pd.DataFrame()
 
 
 def set_master_df(df: Optional[pd.DataFrame]) -> None:
-    """Stores a new master table and resets the editor widget state."""
+    """Stores a new master table and resets widget state that depends on it."""
     st.session_state.df_master = df
     st.session_state.editor_version += 1
     clear_results()
+
+
+def has_master() -> bool:
+    df = st.session_state.df_master
+    return df is not None and not df.empty
+
+
+def current_limits() -> TransportLimits:
+    vehicle_data = st.session_state.vehicle_catalog[st.session_state.selected_vehicle]
+    return get_transport_limits(vehicle_data, st.session_state.assumptions)
+
+
+def current_vehicle_data() -> Dict[str, float]:
+    return st.session_state.vehicle_catalog[st.session_state.selected_vehicle]
+
+
+def go_step(step: int) -> None:
+    st.session_state.step = max(0, min(len(STEPS) - 1, int(step)))
+    st.session_state.step_ctl = STEP_LABELS[st.session_state.step]
+
+
+def step_control_changed() -> None:
+    value = st.session_state.get("step_ctl")
+    if value in STEP_LABELS:
+        st.session_state.step = STEP_LABELS.index(value)
+    else:
+        st.session_state.step_ctl = STEP_LABELS[st.session_state.step]
 
 
 def apply_loaded_job_to_session(loaded: Dict[str, Any]) -> None:
@@ -3011,14 +3075,340 @@ def apply_loaded_job_to_session(loaded: Dict[str, Any]) -> None:
     set_master_df(loaded["master_df"])
 
 
-def current_limits() -> TransportLimits:
-    vehicle_data = st.session_state.vehicle_catalog[st.session_state.selected_vehicle]
-    return get_transport_limits(vehicle_data, st.session_state.assumptions)
+# ----------------------------------------------------------
+# Job store (one JSON file per job, one folder per user)
+# ----------------------------------------------------------
+
+def jobs_dir() -> Optional[str]:
+    base = os.environ.get("ULTRALOGISTICS_JOBS_DIR") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "jobs"
+    )
+    path = os.path.join(base, slugify(st.session_state.get("username", ""), "shared"))
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return None
+    return path
 
 
-def has_master() -> bool:
+def new_job_id(name: str = "") -> str:
+    return f"{datetime.now():%Y%m%d-%H%M%S}-{slugify(name, 'job')[:30]}"
+
+
+def reset_job_state() -> None:
+    st.session_state.project = ProjectMeta()
+    st.session_state.assumptions = LogisticsAssumptions()
+    st.session_state.orders = {}
+    st.session_state.df_master = None
+    st.session_state.decided = {}
+    st.session_state.selected_order = ""
+    st.session_state.order_issues = {}
+    st.session_state.last_validation_df = pd.DataFrame()
+    st.session_state.unit_issue_df = pd.DataFrame()
+    st.session_state.editor_version += 1
+    st.session_state.last_saved_hash = ""
+    clear_results()
+    go_step(0)
+
+
+def start_new_job() -> None:
+    reset_job_state()
+    st.session_state.job_id = new_job_id("new-job")
+
+
+def open_saved_job(payload: Dict[str, Any], job_id: Optional[str] = None) -> None:
+    loaded = load_job_payload(payload)
+    reset_job_state()
+    apply_loaded_job_to_session(loaded)
+    st.session_state.decided = dict(loaded.get("decided") or {})
+    st.session_state.job_id = job_id or loaded.get("job_id") or new_job_id(loaded["project"].project_name)
+    go_step(int(loaded.get("step") or 0))
+
+
+def open_job_by_id(job_id: str) -> None:
+    folder = jobs_dir()
+    if not folder:
+        return
+    try:
+        with open(os.path.join(folder, f"{job_id}.json"), encoding="utf-8") as fh:
+            open_saved_job(json.load(fh), job_id)
+    except (OSError, ValueError):
+        pass
+
+
+def delete_job_file(job_id: str) -> None:
+    folder = jobs_dir()
+    if folder:
+        try:
+            os.remove(os.path.join(folder, f"{job_id}.json"))
+        except OSError:
+            pass
+    st.session_state.confirm_delete = ""
+
+
+def list_jobs() -> List[Dict[str, Any]]:
+    folder = jobs_dir()
+    if not folder:
+        return []
+
+    entries: List[Tuple[float, Dict[str, Any]]] = []
+    for name in os.listdir(folder):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(folder, name)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            project = payload.get("project", {}) or {}
+            entries.append(
+                (
+                    os.path.getmtime(path),
+                    {
+                        "id": name[:-5],
+                        "name": clean_str(project.get("project_name")) or "Untitled job",
+                        "reference": clean_str(project.get("quote_or_job_ref")),
+                        "saved_at": clean_str(payload.get("saved_at")),
+                        "status": payload.get("status") or {"label": "Add units", "tone": "neutral"},
+                    },
+                )
+            )
+        except (OSError, ValueError):
+            continue
+
+    return [job for _, job in sorted(entries, key=lambda x: x[0], reverse=True)]
+
+
+def compute_status() -> Dict[str, Any]:
     df = st.session_state.df_master
-    return df is not None and not df.empty
+    units = 0 if df is None else len(df)
+    orders = 0 if units == 0 else int(df["Order"].nunique())
+    status: Dict[str, Any] = {"label": "Add units", "tone": "neutral", "units": units, "orders": orders}
+
+    if units == 0:
+        return status
+
+    try:
+        review = build_review(df, current_vehicle_data(), st.session_state.assumptions, st.session_state.decided)
+        left = review["decisions_left"]
+        if left:
+            status.update(label=f"{left} decision{'s' if left != 1 else ''} left", tone="warn")
+        elif st.session_state.results and st.session_state.results.get("ok"):
+            n = len(st.session_state.results["loads"])
+            status.update(label=f"Plan ready, {n} container{'s' if n != 1 else ''}", tone="good")
+        else:
+            status.update(label="Ready to plan", tone="neutral")
+    except Exception:  # noqa: BLE001  status is cosmetic
+        pass
+
+    return status
+
+
+def save_current_job() -> None:
+    job_id = st.session_state.get("job_id")
+    folder = jobs_dir()
+    if not job_id or not folder:
+        return
+
+    project: ProjectMeta = st.session_state.project
+    if not project.project_name and not has_master() and not any(clean_str(v) for v in st.session_state.orders.values()):
+        return  # empty draft, nothing worth keeping
+
+    payload = build_job_save_payload(
+        project,
+        st.session_state.assumptions,
+        st.session_state.orders,
+        st.session_state.df_master,
+        st.session_state.selected_vehicle,
+        st.session_state.selected_pallets,
+        extra={
+            "job_id": job_id,
+            "step": st.session_state.step,
+            "decided": st.session_state.decided,
+            "status": compute_status(),
+        },
+    )
+
+    body = {k: v for k, v in payload.items() if k != "saved_at"}
+    digest = hashlib.md5(json.dumps(body, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    if digest == st.session_state.last_saved_hash:
+        return
+
+    path = os.path.join(folder, f"{job_id}.json")
+    try:
+        with open(path + ".tmp", "wb") as fh:
+            fh.write(json_download_bytes(payload))
+        os.replace(path + ".tmp", path)
+        st.session_state.last_saved_hash = digest
+    except OSError:
+        pass
+
+
+def go_home() -> None:
+    save_current_job()
+    st.session_state.job_id = None
+
+
+# ==========================================================
+# 19b. REVIEW ENGINE (turns the transport check into per-unit decisions)
+# ==========================================================
+
+def base_transport_class(p: Piece, lim: TransportLimits) -> str:
+    """Class a unit would get with no special handling (WHOLE, AUTO)."""
+    probe = Piece(
+        orig_id=p.orig_id, piece_id=p.piece_id, w=p.w, h=p.h, utype=p.utype, d=p.d, lbs=p.lbs,
+        mode="WHOLE", orientation="AUTO", source_order=p.source_order,
+    )
+    return probe.transport_class(lim)
+
+
+def split_layout(p: Piece, lim: TransportLimits, a: LogisticsAssumptions) -> Tuple[int, int]:
+    rows = max(1, math.ceil(p.h / lim.std_max_v))
+    cols = max(1, math.ceil(p.lbs / a.max_crate_lbs)) if p.lbs > a.max_crate_lbs else 1
+    if rows * cols == 1:
+        cols = 2
+    return rows, cols
+
+
+def current_unit_choice(row: pd.Series, default_cls: str) -> Optional[str]:
+    mode = clean_str(row.get("Mode")).upper()
+    sr = safe_int(row.get("SR"), 1) or 1
+    sc = safe_int(row.get("SC"), 1) or 1
+    if mode == "SLANT":
+        return OPT_SLANT
+    if mode == "DISASSEMBLED":
+        return OPT_DIS
+    if sr * sc > 1:
+        return OPT_SPLIT
+    return OPT_LOW if default_cls == CLASS_LOW else None
+
+
+def build_review(
+    master_df: pd.DataFrame,
+    vehicle_data: Dict[str, float],
+    a: LogisticsAssumptions,
+    decided: Dict[str, str],
+) -> Dict[str, Any]:
+    lim = get_transport_limits(vehicle_data, a)
+    issue_df = build_unit_issue_report(master_df, vehicle_data, a)
+
+    issues_by_unit: Dict[str, Dict[str, str]] = {}
+    if not issue_df.empty:
+        for unit, sub in issue_df.groupby("Unit", sort=False):
+            sevs = set(sub["Severity"])
+            severity = "ERROR" if "ERROR" in sevs else ("WARNING" if "WARNING" in sevs else "INFO")
+            issues_by_unit[str(unit)] = {
+                "severity": severity,
+                "problem": "; ".join(dict.fromkeys(sub["Problem"])),
+            }
+
+    groups: List[Dict[str, Any]] = []
+    normal_units = 0
+
+    for orig, sub in master_df.groupby("Orig", sort=False):
+        row = sub.iloc[0]
+        p = row_to_piece(row)
+        if p is None:
+            continue
+
+        count = len(sub)
+        info = issues_by_unit.get(str(orig), {})
+        severity = info.get("severity", "")
+        default_cls = base_transport_class(p, lim)
+        current = current_unit_choice(row, default_cls)
+        need = default_cls in (CLASS_LOW, CLASS_OVERSIZE) or severity == "ERROR"
+
+        group = {
+            "orig": str(orig),
+            "order": clean_str(row.get("Order")),
+            "mark": clean_str(row.get("Mark")),
+            "type": clean_str(row.get("Type")),
+            "count": count,
+            "w": p.w,
+            "h": p.h,
+            "lbs": p.lbs,
+            "default_cls": default_cls,
+            "severity": severity,
+            "problem": info.get("problem", ""),
+            "current": current,
+            "options": [],
+            "kind": "normal",
+        }
+
+        if need:
+            if default_cls == CLASS_LOW:
+                options = [OPT_SLANT] if min(p.w, p.h) <= lim.slant_max_v else []
+                options.append(OPT_LOW)
+            else:
+                options = [OPT_DIS, OPT_SPLIT]
+
+            handled = (str(orig) in decided) or (current is not None and current != OPT_LOW)
+            group["options"] = options
+            group["kind"] = "resolved" if (handled and severity != "ERROR") else "decide"
+        elif severity == "INFO":
+            group["kind"] = "note"
+        else:
+            normal_units += count
+
+        groups.append(group)
+
+    return {
+        "groups": groups,
+        "normal_units": normal_units,
+        "total_units": len(master_df),
+        "decisions_left": sum(1 for g in groups if g["kind"] == "decide"),
+        "issue_df": issue_df,
+        "limits": lim,
+    }
+
+
+def apply_unit_choice(orig: str, choice: str, vehicle_data: Dict[str, float], a: LogisticsAssumptions) -> None:
+    df = st.session_state.df_master.copy()
+    mask = df["Orig"] == orig
+    if not mask.any():
+        return
+
+    lim = get_transport_limits(vehicle_data, a)
+    p = row_to_piece(df[mask].iloc[0])
+
+    if choice == OPT_SLANT:
+        mode, orient, sr, sc = "SLANT", "AUTO", 1, 1
+    elif choice == OPT_LOW:
+        mode, orient, sr, sc = "WHOLE", "AUTO", 1, 1
+    elif choice == OPT_DIS:
+        rows = max(1, math.ceil(p.h / lim.std_max_v)) if p else 1
+        mode, orient, sr, sc = "DISASSEMBLED", "AUTO", (rows if p and min(p.w, p.h) > lim.std_max_v else 1), 1
+    else:
+        sr, sc = split_layout(p, lim, a) if p else (2, 1)
+        mode, orient = "WHOLE", "UPRIGHT"
+
+    df.loc[mask, ["Mode", "Orient", "SR", "SC"]] = [mode, orient, sr, sc]
+    st.session_state.df_master = df
+    st.session_state.decided[orig] = choice
+    clear_results()
+
+
+def option_text(choice: str, g: Dict[str, Any], lim: TransportLimits, a: LogisticsAssumptions) -> Tuple[str, str]:
+    if choice == OPT_SLANT:
+        return "Slant rack, glass stays in", "Avoids a separate glass shipment. Confirm with the factory."
+    if choice == OPT_LOW:
+        return "Low-floor pallet, glass ships separately", "Transport only. Not suited to transshipment or rough handling."
+    if choice == OPT_DIS:
+        return "Take apart", "Ships as a frame kit with loose glass on pallets."
+    probe = Piece(orig_id=g["orig"], piece_id=g["orig"], w=g["w"], h=g["h"], utype=g["type"], d=1.0, lbs=g["lbs"])
+    rows, cols = split_layout(probe, lim, a)
+    return f"Split into {rows * cols} parts", "Each part ships whole. The parts are joined on site."
+
+
+def vehicle_label(name: str) -> str:
+    data = st.session_state.vehicle_catalog.get(name, {})
+    door = safe_float(data.get("door_H"), None)
+    payload = float(data.get("max_lbs", 0) or 0)
+    parts = [name]
+    if door:
+        parts.append(f'door {door:.1f}"')
+    if payload:
+        parts.append(f"{payload:,.0f} lbs")
+    return ", ".join(parts)
 
 
 # ==========================================================
@@ -3068,411 +3458,592 @@ def check_password() -> bool:
 
 
 # ==========================================================
-# 21. SIDEBAR: CONFIG, PROJECT, ASSUMPTIONS
+# 21. TOP BAR, STEPPER, JOBS HOME
 # ==========================================================
 
-def render_sidebar() -> None:
-    with st.sidebar:
-        st.title("Setup")
-        st.caption(f"Logged in as: {st.session_state.get('username', '')}")
-
-        if st.button("Logout", **ui.STRETCH):
+def render_topbar() -> None:
+    left, right = st.columns([5, 2], vertical_alignment="center")
+    with left:
+        ui.page_header(APP_NAME, "Crating and container load planning")
+    with right:
+        buttons = st.columns(2)
+        if st.session_state.job_id:
+            buttons[0].button("All jobs", on_click=go_home, key="topbar_home", **ui.STRETCH)
+        if buttons[1].button("Log out", key="topbar_logout", **ui.STRETCH):
             st.session_state.authenticated = False
             st.session_state.username = ""
+            st.session_state.job_id = None
             st.rerun()
 
-        st.markdown("---")
 
-        with st.expander("Custom Vehicles / Pallets", expanded=False):
-            st.caption("Optional JSON config. Vehicles: L, W, H, door_H, max_lbs (inches / lbs).")
-            st.download_button(
-                "Download Sample Config JSON",
-                data=json_download_bytes(sample_config_json()),
-                file_name="ultralogistics_config_sample.json",
-                mime="application/json",
-                **ui.STRETCH,
+def render_stepper() -> None:
+    if hasattr(st, "segmented_control"):
+        st.segmented_control(
+            "Steps", STEP_LABELS, selection_mode="single", key="step_ctl",
+            on_change=step_control_changed, label_visibility="collapsed",
+        )
+    else:
+        st.radio(
+            "Steps", STEP_LABELS, key="step_ctl", horizontal=True,
+            on_change=step_control_changed, label_visibility="collapsed",
+        )
+
+
+def render_home() -> None:
+    head = st.columns([5, 1.4], vertical_alignment="bottom")
+    with head[0]:
+        ui.headline("Jobs", "Pick up where you left off, or start a new job.")
+    with head[1]:
+        st.button("New job", type="primary", on_click=start_new_job, key="home_new", **ui.STRETCH)
+
+    folder = jobs_dir()
+    jobs = list_jobs()
+
+    if folder is None:
+        st.info("Jobs cannot be saved on this server. Download the job file from the Plan step to keep a job.")
+    elif not jobs:
+        st.info("No jobs yet. Start a new job, add the units, and it is saved here automatically.")
+
+    for job in jobs:
+        status = job["status"]
+        with st.container(border=True):
+            cols = st.columns([5, 3, 1.2, 1.2], vertical_alignment="center")
+            meta = " | ".join(x for x in [job["reference"], status.get("units") and f"{status['units']} units", job["saved_at"]] if x)
+            cols[0].markdown(
+                f"**{_html.escape(job['name'])}**  \n<span style='color:#6e6e73;font-size:.86rem'>{_html.escape(meta)}</span>",
+                unsafe_allow_html=True,
             )
-
-            config_upload = st.file_uploader("Upload Config JSON", type=["json"], key="config_upload")
-            uploaded_config = None
-            if config_upload is not None:
-                try:
-                    uploaded_config = read_uploaded_json(config_upload)
-                    st.success("Config JSON loaded.")
-                except Exception as e:  # noqa: BLE001
-                    st.error(f"Could not read config JSON: {e}")
-
-            vehicle_catalog, pallet_catalog, config_warnings = merge_custom_config(uploaded_config)
-            for warning in config_warnings:
-                st.warning(warning)
-
-            st.session_state.vehicle_catalog = vehicle_catalog
-            st.session_state.pallet_catalog = pallet_catalog
-
-        with st.expander("Load Saved Job", expanded=False):
-            job_upload = st.file_uploader("Upload saved job JSON", type=["json"], key="job_upload")
-            if st.button("Load Job JSON", **ui.STRETCH):
-                if job_upload is None:
-                    st.warning("Upload a job JSON first.")
-                else:
-                    try:
-                        apply_loaded_job_to_session(load_job_payload(read_uploaded_json(job_upload)))
-                        st.success("Job loaded.")
-                    except Exception as e:  # noqa: BLE001
-                        st.error(f"Could not load job JSON: {e}")
-
-        with st.expander("Project Metadata", expanded=False):
-            p0: ProjectMeta = st.session_state.project
-            st.session_state.project = ProjectMeta(
-                project_name=st.text_input("Project Name", value=p0.project_name),
-                customer=st.text_input("Customer", value=p0.customer),
-                project_location=st.text_input("Project Location", value=p0.project_location),
-                destination=st.text_input("Destination", value=p0.destination),
-                factory=st.text_input("Factory", value=p0.factory),
-                system=st.text_input("System", value=p0.system),
-                estimator=st.text_input("Estimator", value=p0.estimator),
-                estimator_email=st.text_input("Estimator Email", value=p0.estimator_email),
-                quote_or_job_ref=st.text_input("Quote / Job Ref", value=p0.quote_or_job_ref),
-                revision=st.text_input("Revision", value=p0.revision),
-                notes=st.text_area("Project Notes", value=p0.notes, height=80),
+            cols[1].markdown(ui.pill(status.get("label", ""), status.get("tone", "neutral")), unsafe_allow_html=True)
+            cols[2].button("Open", key=f"open_{job['id']}", on_click=open_job_by_id, args=(job["id"],), **ui.STRETCH)
+            cols[3].button(
+                "Delete", key=f"del_{job['id']}",
+                on_click=lambda jid=job["id"]: st.session_state.update(confirm_delete=jid), **ui.STRETCH,
             )
+            if st.session_state.confirm_delete == job["id"]:
+                st.warning(f"Delete {job['name']}? This cannot be undone.")
+                confirm = st.columns([1, 1, 4])
+                confirm[0].button("Delete job", key=f"delok_{job['id']}", type="primary",
+                                  on_click=delete_job_file, args=(job["id"],), **ui.STRETCH)
+                confirm[1].button("Keep it", key=f"delno_{job['id']}",
+                                  on_click=lambda: st.session_state.update(confirm_delete=""), **ui.STRETCH)
 
-        a0: LogisticsAssumptions = st.session_state.assumptions
+    with st.expander("Open a job file", expanded=False):
+        job_upload = st.file_uploader("Job file (.json)", type=["json"], key="job_upload")
+        if st.button("Open this file", key="open_file_btn", disabled=job_upload is None):
+            try:
+                open_saved_job(read_uploaded_json(job_upload))
+                st.rerun()
+            except Exception as e:  # noqa: BLE001
+                st.error(f"Could not open the file: {e}")
 
-        with st.expander("Factory Transport Rules", expanded=True):
-            st.caption("Unit height as shipped (vertical). Defaults follow the factory 40' HC guidance.")
-            factory_std_max_mm = st.number_input(
-                "Standard pallet max (mm)", min_value=500.0, max_value=4000.0,
-                value=float(a0.factory_std_max_mm), step=1.0,
-            )
-            allow_low_floor = st.checkbox(
-                "Allow low-floor pallet (unit ships without glass)", value=bool(a0.allow_low_floor),
-            )
-            factory_low_floor_max_mm = st.number_input(
-                "Low-floor pallet max (mm)", min_value=500.0, max_value=4000.0,
-                value=float(a0.factory_low_floor_max_mm), step=1.0, disabled=not allow_low_floor,
-            )
-            factory_slant_max_mm = st.number_input(
-                "Slant rack max unit height (mm)", min_value=500.0, max_value=5000.0,
-                value=float(a0.factory_slant_max_mm), step=1.0,
-            )
-            std_pack_overhead = st.number_input(
-                "Standard package height overhead (in)", min_value=0.0, max_value=24.0,
-                value=float(a0.std_pack_overhead), step=0.5,
-                help="Pallet/crate base + top added to the unit height.",
-            )
-            low_floor_pack_overhead = st.number_input(
-                "Low-floor package height overhead (in)", min_value=0.0, max_value=24.0,
-                value=float(a0.low_floor_pack_overhead), step=0.5,
-            )
 
-        with st.expander("Weight / Packing Assumptions", expanded=False):
-            assumptions = LogisticsAssumptions(
-                glass_kg_m2=st.number_input("Glass kg/m²", min_value=10.0, max_value=80.0,
-                                            value=float(a0.glass_kg_m2), step=1.0),
-                std_weight_multiplier=st.number_input("Total Weight Multiplier - Standard", min_value=1.0,
-                                                      max_value=3.0, value=float(a0.std_weight_multiplier),
-                                                      step=0.05),
-                lsd_weight_multiplier=st.number_input("Total Weight Multiplier - LSD / Sliding", min_value=1.0,
-                                                      max_value=3.0, value=float(a0.lsd_weight_multiplier),
-                                                      step=0.05),
-                frame_kit_pct_disassembly=st.slider("Frame kit share - forced disassembly", 0.0, 0.5,
-                                                    float(a0.frame_kit_pct_disassembly), 0.01),
-                frame_kit_pct_split=st.slider("Frame kit share - disassembly with manual split", 0.0, 0.5,
-                                              float(a0.frame_kit_pct_split), 0.01),
-                max_crate_lbs=st.number_input("Max Crate Lbs", min_value=500.0, max_value=12000.0,
-                                              value=float(a0.max_crate_lbs), step=100.0),
-                max_pallet_lbs=st.number_input("Max Pallet Lbs", min_value=500.0, max_value=10000.0,
-                                               value=float(a0.max_pallet_lbs), step=100.0),
-                crate_max_len_ext=st.number_input("Max Crate Length Ext (in)", min_value=48.0, max_value=800.0,
-                                                  value=float(a0.crate_max_len_ext), step=6.0),
-                crate_max_width_ext=st.number_input("Max Crate Width / Depth Ext (in)", min_value=12.0,
-                                                    max_value=120.0, value=float(a0.crate_max_width_ext),
-                                                    step=1.0),
-                slant_rack_max_depth_ext=st.number_input("Max Slant Rack Depth Ext (in)", min_value=12.0,
-                                                         max_value=120.0,
-                                                         value=float(a0.slant_rack_max_depth_ext), step=1.0),
-                crate_max_volume_ext=st.number_input("Max Crate Volume Ext (in³)", min_value=10_000.0,
-                                                     max_value=5_000_000.0,
-                                                     value=float(a0.crate_max_volume_ext), step=50_000.0),
-                vehicle_height_clearance=st.number_input("Vehicle/Door Height Clearance (in)", min_value=0.0,
-                                                         max_value=24.0,
-                                                         value=float(a0.vehicle_height_clearance), step=0.5),
-                container_item_clearance=st.number_input("Floor Item Clearance (in)", min_value=0.0,
-                                                         max_value=12.0,
-                                                         value=float(a0.container_item_clearance), step=0.5),
-                factory_std_max_mm=factory_std_max_mm,
-                factory_low_floor_max_mm=factory_low_floor_max_mm,
-                factory_slant_max_mm=factory_slant_max_mm,
-                allow_low_floor=allow_low_floor,
-                std_pack_overhead=std_pack_overhead,
-                low_floor_pack_overhead=low_floor_pack_overhead,
-                no_mixing_orders=st.checkbox("Do not mix orders inside crates/pallets",
-                                             value=bool(a0.no_mixing_orders)),
-                allow_pallets_for_disassembled=st.checkbox("Use pallets for disassembled pieces",
-                                                           value=bool(a0.allow_pallets_for_disassembled)),
-                planning_warning=a0.planning_warning,
-            )
+# ==========================================================
+# 22. STEP 1: JOB
+# ==========================================================
 
-        # Compare by value: Streamlit re-executes the script on every rerun, so the
-        # stored object belongs to an older copy of the class and == would fail.
-        if asdict(assumptions) != asdict(st.session_state.assumptions):
-            st.session_state.assumptions = assumptions
-            clear_results()
+def render_assumption_widgets(a0: LogisticsAssumptions) -> LogisticsAssumptions:
+    st.markdown("##### Factory transport rules")
+    st.caption("Unit height as shipped. Defaults follow the factory 40' HC guidance.")
+    c = st.columns(3)
+    factory_std_max_mm = c[0].number_input(
+        "Standard pallet max (mm)", min_value=500.0, max_value=4000.0, value=float(a0.factory_std_max_mm), step=1.0)
+    allow_low_floor = c[1].checkbox("Allow low-floor pallet (no glass)", value=bool(a0.allow_low_floor))
+    factory_low_floor_max_mm = c[2].number_input(
+        "Low-floor pallet max (mm)", min_value=500.0, max_value=4000.0,
+        value=float(a0.factory_low_floor_max_mm), step=1.0, disabled=not allow_low_floor)
+    c = st.columns(3)
+    factory_slant_max_mm = c[0].number_input(
+        "Slant rack max unit height (mm)", min_value=500.0, max_value=5000.0,
+        value=float(a0.factory_slant_max_mm), step=1.0)
+    std_pack_overhead = c[1].number_input(
+        "Standard package overhead (in)", min_value=0.0, max_value=24.0, value=float(a0.std_pack_overhead), step=0.5)
+    low_floor_pack_overhead = c[2].number_input(
+        "Low-floor package overhead (in)", min_value=0.0, max_value=24.0,
+        value=float(a0.low_floor_pack_overhead), step=0.5)
 
-        st.markdown("---")
-        st.subheader("Vehicle / Pallets")
+    st.markdown("##### Weight and packing")
+    c = st.columns(3)
+    glass_kg_m2 = c[0].number_input("Glass kg/m²", min_value=10.0, max_value=80.0, value=float(a0.glass_kg_m2), step=1.0)
+    std_mult = c[1].number_input("Weight multiplier, standard", min_value=1.0, max_value=3.0,
+                                 value=float(a0.std_weight_multiplier), step=0.05)
+    lsd_mult = c[2].number_input("Weight multiplier, lift and slide", min_value=1.0, max_value=3.0,
+                                 value=float(a0.lsd_weight_multiplier), step=0.05)
+    c = st.columns(2)
+    frame_dis = c[0].slider("Frame kit share, take apart", 0.0, 0.5, float(a0.frame_kit_pct_disassembly), 0.01)
+    frame_split = c[1].slider("Frame kit share, take apart with split", 0.0, 0.5,
+                              float(a0.frame_kit_pct_split), 0.01)
+    c = st.columns(4)
+    max_crate_lbs = c[0].number_input("Max crate lbs", min_value=500.0, max_value=12000.0,
+                                      value=float(a0.max_crate_lbs), step=100.0)
+    max_pallet_lbs = c[1].number_input("Max pallet lbs", min_value=500.0, max_value=10000.0,
+                                       value=float(a0.max_pallet_lbs), step=100.0)
+    crate_len = c[2].number_input("Max crate length (in)", min_value=48.0, max_value=800.0,
+                                  value=float(a0.crate_max_len_ext), step=6.0)
+    crate_width = c[3].number_input("Max crate width (in)", min_value=12.0, max_value=120.0,
+                                    value=float(a0.crate_max_width_ext), step=1.0)
+    c = st.columns(4)
+    slant_depth = c[0].number_input("Max slant rack depth (in)", min_value=12.0, max_value=120.0,
+                                    value=float(a0.slant_rack_max_depth_ext), step=1.0)
+    crate_volume = c[1].number_input("Max crate volume (in³)", min_value=10_000.0, max_value=5_000_000.0,
+                                     value=float(a0.crate_max_volume_ext), step=50_000.0)
+    height_clear = c[2].number_input("Door height clearance (in)", min_value=0.0, max_value=24.0,
+                                     value=float(a0.vehicle_height_clearance), step=0.5)
+    floor_clear = c[3].number_input("Floor item clearance (in)", min_value=0.0, max_value=12.0,
+                                    value=float(a0.container_item_clearance), step=0.5)
+    c = st.columns(2)
+    no_mixing = c[0].checkbox("Do not mix orders inside crates and pallets", value=bool(a0.no_mixing_orders))
+    pallets_for_dis = c[1].checkbox("Use pallets for taken-apart pieces", value=bool(a0.allow_pallets_for_disassembled))
+
+    return LogisticsAssumptions(
+        glass_kg_m2=glass_kg_m2,
+        std_weight_multiplier=std_mult,
+        lsd_weight_multiplier=lsd_mult,
+        frame_kit_pct_disassembly=frame_dis,
+        frame_kit_pct_split=frame_split,
+        max_crate_lbs=max_crate_lbs,
+        max_pallet_lbs=max_pallet_lbs,
+        crate_max_len_ext=crate_len,
+        crate_max_width_ext=crate_width,
+        slant_rack_max_depth_ext=slant_depth,
+        crate_max_volume_ext=crate_volume,
+        vehicle_height_clearance=height_clear,
+        container_item_clearance=floor_clear,
+        factory_std_max_mm=factory_std_max_mm,
+        factory_low_floor_max_mm=factory_low_floor_max_mm,
+        factory_slant_max_mm=factory_slant_max_mm,
+        allow_low_floor=allow_low_floor,
+        std_pack_overhead=std_pack_overhead,
+        low_floor_pack_overhead=low_floor_pack_overhead,
+        no_mixing_orders=no_mixing,
+        allow_pallets_for_disassembled=pallets_for_dis,
+        planning_warning=a0.planning_warning,
+    )
+
+
+def render_advanced_settings(job: str) -> None:
+    p0: ProjectMeta = st.session_state.project
+
+    st.markdown("##### More job details")
+    c = st.columns(2)
+    destination = c[0].text_input("Destination", value=p0.destination, key=f"job_dest_{job}")
+    location = c[1].text_input("Project location", value=p0.project_location, key=f"job_loc_{job}")
+    system = c[0].text_input("System", value=p0.system, key=f"job_sys_{job}")
+    revision = c[1].text_input("Revision", value=p0.revision, key=f"job_rev_{job}")
+    estimator = c[0].text_input("Estimator", value=p0.estimator, key=f"job_est_{job}")
+    estimator_email = c[1].text_input("Estimator email", value=p0.estimator_email, key=f"job_mail_{job}")
+    notes = st.text_area("Notes", value=p0.notes, height=70, key=f"job_notes_{job}")
+    st.session_state.project = replace(
+        st.session_state.project, destination=destination, project_location=location, system=system,
+        revision=revision, estimator=estimator, estimator_email=estimator_email, notes=notes,
+    )
+
+    a0: LogisticsAssumptions = st.session_state.assumptions
+    assumptions = render_assumption_widgets(a0)
+    # Compare by value: the stored object may come from an older run of the script.
+    if asdict(assumptions) != asdict(a0):
+        st.session_state.assumptions = assumptions
+        clear_results()
+
+    st.markdown("##### Pallets for taken-apart pieces")
+    pallet_names = list(st.session_state.pallet_catalog.keys())
+    valid_default = [p for p in st.session_state.selected_pallets if p in pallet_names] or pallet_names[:1]
+    selected = st.multiselect("Pallets and racks allowed", pallet_names, default=valid_default, key=f"pallets_{job}")
+    if selected != st.session_state.selected_pallets:
+        st.session_state.selected_pallets = selected
+        clear_results()
+
+    st.markdown("##### Custom vehicles and pallets")
+    st.caption("Optional JSON file. Vehicles use L, W, H, door_H and max_lbs (inches and lbs).")
+    st.download_button(
+        "Download sample config", data=json_download_bytes(sample_config_json()),
+        file_name="ultralogistics_config_sample.json", mime="application/json", key="sample_cfg_dl",
+    )
+    config_upload = st.file_uploader("Upload config JSON", type=["json"], key="config_upload")
+    if config_upload is not None:
+        try:
+            st.session_state.custom_config = read_uploaded_json(config_upload)
+            st.success("Config loaded.")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Could not read the config: {e}")
+
+    vehicles, pallets, warnings = merge_custom_config(st.session_state.custom_config)
+    for warning in warnings:
+        st.warning(warning)
+    st.session_state.vehicle_catalog = vehicles
+    st.session_state.pallet_catalog = pallets
+
+
+def render_step_job() -> None:
+    job = st.session_state.job_id
+    ui.headline("Start a job", "Name it and pick the vehicle. The factory transport rules are applied for you.")
+
+    p0: ProjectMeta = st.session_state.project
+
+    with st.container(border=True):
+        c = st.columns(2)
+        name = c[0].text_input("Job name", value=p0.project_name, key=f"job_name_{job}")
+        customer = c[1].text_input("Customer", value=p0.customer, key=f"job_customer_{job}")
+        reference = c[0].text_input("Quote or job reference", value=p0.quote_or_job_ref, key=f"job_ref_{job}")
+        factory = c[1].text_input("Factory", value=p0.factory, key=f"job_factory_{job}")
 
         vehicle_names = list(st.session_state.vehicle_catalog.keys())
         if st.session_state.selected_vehicle not in vehicle_names:
             st.session_state.selected_vehicle = vehicle_names[0]
 
-        selected_vehicle = st.selectbox(
-            "Vehicle", vehicle_names, index=vehicle_names.index(st.session_state.selected_vehicle),
+        vehicle_labels = {vehicle_label(n): n for n in vehicle_names}
+        current_label = vehicle_label(st.session_state.selected_vehicle)
+        picked_label = st.radio(
+            "Vehicle", list(vehicle_labels.keys()), index=list(vehicle_labels.keys()).index(current_label),
+            horizontal=True, key=f"vehicle_{job}",
         )
-        if selected_vehicle != st.session_state.selected_vehicle:
-            st.session_state.selected_vehicle = selected_vehicle
+        vehicle = vehicle_labels[picked_label]
+        if vehicle != st.session_state.selected_vehicle:
+            st.session_state.selected_vehicle = vehicle
             clear_results()
 
-        pallet_names = list(st.session_state.pallet_catalog.keys())
-        valid_default = [p for p in st.session_state.selected_pallets if p in pallet_names]
-        if not valid_default and pallet_names:
-            valid_default = [pallet_names[0]]
-
-        st.session_state.selected_pallets = st.multiselect(
-            "Pallets / Racks Allowed (disassembled parts)", pallet_names, default=valid_default,
-        )
-
-        vehicle_data = st.session_state.vehicle_catalog[selected_vehicle]
-        lim = current_limits()
-        door = safe_float(vehicle_data.get("door_H"), None)
-
-        st.caption(
-            f'Interior: {vehicle_data["L"]:.0f}"L x {vehicle_data["W"]:.0f}"W x {vehicle_data["H"]:.0f}"H'
-            + (f' · door {door:.1f}"' if door else " · no door height set")
-        )
-        st.caption(
-            f"Max package height: {inches_mm_text(lim.usable_ext_h)}  \n"
-            f"Standard pallet unit ≤ {inches_mm_text(lim.std_max_v)}  \n"
-            f"Low-floor unit (no glass) ≤ {inches_mm_text(lim.low_floor_max_v)}  \n"
-            f"Slant rack unit ≤ {inches_mm_text(lim.slant_max_v)}"
-        )
-
-        st.markdown("---")
-        st.subheader("Save Job")
-        st.download_button(
-            "Download Job JSON",
-            data=json_download_bytes(
-                build_job_save_payload(
-                    st.session_state.project,
-                    st.session_state.assumptions,
-                    st.session_state.orders,
-                    st.session_state.df_master,
-                    st.session_state.selected_vehicle,
-                    st.session_state.selected_pallets,
-                )
-            ),
-            file_name=f"{today_file_stamp()}-{slugify(st.session_state.project.display_name())}-logistics-plan.json",
-            mime="application/json",
-            **ui.STRETCH,
-            key="sidebar_job_download",
-        )
-
-
-# ==========================================================
-# 22. TAB 1 — DATA INPUT
-# ==========================================================
-
-def render_tab_input() -> None:
-    st.header("Data Input")
-    st.info(
-        "Paste order rows manually or upload an Excel/CSV file. "
-        "Manual paste format: ID, W, H, Type, Qty (inches)."
+    st.session_state.project = replace(
+        p0, project_name=name, customer=customer, quote_or_job_ref=reference, factory=factory,
     )
 
-    c_left, c_right = st.columns([1, 1])
-
-    with c_left:
-        st.subheader("Manual Order Paste")
-
-        order_name = st.text_input("Order Name", value="Order 1", key="manual_order_name")
-        raw_in = st.text_area(
-            "Paste rows: ID, W, H, Type, Qty",
-            height=180,
-            key="manual_raw_input",
-            placeholder="A1, 36, 72, FIXED, 2\nD1, 96, 108, LSD, 1",
-        )
-
-        c_add, c_clear = st.columns(2)
-        with c_add:
-            if st.button("Add / Update Order", **ui.STRETCH):
-                name = clean_str(order_name) or "Order 1"
-                st.session_state.orders[name] = raw_in
-                clear_results()
-                st.success(f"Saved order: {name}")
-        with c_clear:
-            st.button(
-                "Clear Paste Box",
-                **ui.STRETCH,
-                on_click=lambda: st.session_state.update({"manual_raw_input": ""}),
+    lim = current_limits()
+    with st.container(border=True):
+        st.markdown("**How units ship in this vehicle**")
+        a = st.session_state.assumptions
+        rules = [
+            f"Up to {a.factory_std_max_mm:,.0f} mm tall: standard pallet, glass in the unit.",
+        ]
+        if a.allow_low_floor:
+            rules.append(
+                f"{a.factory_std_max_mm + 1:,.0f} to {in_to_mm(lim.low_floor_max_v):,.0f} mm: low-floor pallet, glass ships separately."
             )
+        rules.append(f"Up to {a.factory_slant_max_mm:,.0f} mm: slant rack.")
+        for rule in rules:
+            st.markdown(f"- {rule}")
+        st.caption(f"Largest package this vehicle can load: {inches_mm_text(lim.usable_ext_h)} tall.")
 
-        if st.session_state.orders:
-            st.markdown("#### Saved Orders")
-            for saved_name in list(st.session_state.orders.keys()):
-                row_cols = st.columns([4, 1])
-                with row_cols[0]:
-                    line_count = len([x for x in st.session_state.orders[saved_name].splitlines() if x.strip()])
-                    st.caption(f"**{saved_name}** — {line_count} pasted line(s)")
-                with row_cols[1]:
-                    if st.button("Delete", key=f"delete_order_{saved_name}", **ui.STRETCH):
-                        st.session_state.orders.pop(saved_name, None)
-                        clear_results()
-                        st.rerun()
+    with st.expander("Advanced settings", expanded=False):
+        render_advanced_settings(job)
 
-        process_scope = "ALL ORDERS"
-        if st.session_state.orders:
-            process_scope = st.selectbox("Process Scope", ["ALL ORDERS"] + list(st.session_state.orders.keys()))
+    nav = st.columns([1, 4, 1.6])
+    nav[0].button("All jobs", on_click=go_home, key="job_back", **ui.STRETCH)
+    nav[2].button("Continue to units", type="primary", on_click=go_step, args=(1,), key="job_next", **ui.STRETCH)
 
-        if st.button("Process Manual Orders", type="primary", **ui.STRETCH):
-            if not st.session_state.orders:
-                st.error("No orders saved yet. Click 'Add / Update Order' first.")
-            else:
-                if process_scope == "ALL ORDERS":
-                    items_to_process = list(st.session_state.orders.items())
-                else:
-                    items_to_process = [(process_scope, st.session_state.orders.get(process_scope, ""))]
 
-                all_rows: List[Dict[str, Any]] = []
-                all_issues: List[ValidationIssue] = []
-                for name, text in items_to_process:
-                    rows, issues = parse_order_text_to_rows(name, text, st.session_state.assumptions)
-                    all_rows.extend(rows)
-                    all_issues.extend(issues)
+# ==========================================================
+# 23. STEP 2: UNITS
+# ==========================================================
 
-                set_master_df(pd.DataFrame(all_rows, columns=MASTER_COLUMNS))
-                st.session_state.last_validation_df = validation_issues_to_df(all_issues)
-
-                if all_rows:
-                    st.success(f"Loaded {len(all_rows)} unit row(s).")
-                else:
-                    st.error("No valid rows loaded.")
-
-                if all_issues:
-                    st.warning(f"{len(all_issues)} issue(s) found while parsing.")
-                    st.dataframe(validation_issues_to_df(all_issues), **ui.STRETCH, hide_index=True)
-
-    with c_right:
-        st.subheader("Excel / CSV Upload")
-
-        upload_order_name = st.text_input("Order Name for Upload", value="Uploaded Order", key="upload_order_name")
-        uploaded_file = st.file_uploader(
-            "Upload CSV or Excel", type=["csv", "xlsx", "xlsm", "xls"], key="source_file_upload",
-        )
-
-        if uploaded_file is not None:
-            try:
-                uploaded_df = read_uploaded_dataframe(uploaded_file)
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Could not read uploaded file: {e}")
-                uploaded_df = None
-
-            if uploaded_df is not None:
-                st.success(f"Loaded source file: {uploaded_file.name} ({len(uploaded_df)} row(s))")
-                st.dataframe(uploaded_df.head(20), **ui.STRETCH)
-
-                columns = [str(col) for col in uploaded_df.columns]
-                uploaded_df.columns = columns
-                options = ["<none>"] + columns
-                default_mapping = build_default_column_mapping(columns)
-
-                st.markdown("#### Column Mapping")
-                mapping: Dict[str, str] = {}
-
-                def mapping_select(label: str, logical_name: str, required: bool = False) -> str:
-                    default_col = default_mapping.get(logical_name, "<none>")
-                    return st.selectbox(
-                        f"{label}{' *' if required else ''}",
-                        options,
-                        index=options.index(default_col) if default_col in options else 0,
-                        key=f"mapping_{logical_name}_{uploaded_file.name}",
-                    )
-
-                m1, m2 = st.columns(2)
-                with m1:
-                    mapping["id"] = mapping_select("ID / Mark", "id", True)
-                    mapping["width"] = mapping_select("Width (in)", "width", True)
-                    mapping["height"] = mapping_select("Height (in)", "height", True)
-                    mapping["type"] = mapping_select("Type / System", "type")
-                with m2:
-                    mapping["qty"] = mapping_select("Quantity", "qty")
-                    mapping["depth"] = mapping_select("Depth (in)", "depth")
-                    mapping["weight"] = mapping_select("Weight (lbs)", "weight")
-                    mapping["notes"] = mapping_select("Notes", "notes")
-
-                import_mode = st.radio(
-                    "Import Mode",
-                    ["Replace current master table", "Append to current master table"],
-                    horizontal=True,
-                )
-
-                if st.button("Import Uploaded File", type="primary", **ui.STRETCH):
-                    missing = [k for k in ("id", "width", "height") if mapping.get(k, "<none>") == "<none>"]
-                    if missing:
-                        st.error(f"Map the required column(s) first: {', '.join(missing)}")
-                    else:
-                        rows, issues = normalize_uploaded_table(
-                            uploaded_df,
-                            clean_str(upload_order_name) or "Uploaded Order",
-                            mapping,
-                            st.session_state.assumptions,
-                            uploaded_file.name,
-                        )
-                        new_df = pd.DataFrame(rows, columns=MASTER_COLUMNS)
-
-                        if import_mode.startswith("Append") and has_master():
-                            new_df = pd.concat([st.session_state.df_master, new_df], ignore_index=True)
-
-                        set_master_df(new_df)
-                        st.session_state.last_validation_df = validation_issues_to_df(issues)
-
-                        if rows:
-                            st.success(f"Imported {len(rows)} unit row(s).")
-                        else:
-                            st.error("No valid rows imported.")
-
-                        if issues:
-                            st.warning(f"{len(issues)} issue(s) found while importing.")
-                            st.dataframe(validation_issues_to_df(issues), **ui.STRETCH, hide_index=True)
-
-                        dupes = validate_master_dataframe(new_df)
-                        if any("Duplicate" in i.problem for i in dupes):
-                            st.warning("Duplicate unit IDs found — use a different order name when appending.")
-
-    st.divider()
-    st.subheader("Current Master Table Preview")
+def order_names() -> List[str]:
+    names = list(st.session_state.orders.keys())
     if has_master():
-        st.dataframe(st.session_state.df_master, **ui.STRETCH, hide_index=True)
-    else:
-        st.info("No master table loaded yet.")
+        for n in st.session_state.df_master["Order"].astype(str).unique():
+            if n not in names:
+                names.append(n)
+    return names
 
 
-# ==========================================================
-# 23. TAB 2 — EDIT & VALIDATE
-# ==========================================================
-
-def render_tab_edit() -> None:
-    st.header("Edit & Validate")
-
+def order_unit_count(name: str) -> int:
     if not has_master():
-        st.info("Load data first in the Data Input tab.")
+        return 0
+    return int((st.session_state.df_master["Order"].astype(str) == name).sum())
+
+
+def select_order(name: str) -> None:
+    st.session_state.selected_order = name
+
+
+def add_order() -> None:
+    names = order_names()
+    n = len(names) + 1
+    while f"Order {n}" in names:
+        n += 1
+    name = f"Order {n}"
+    st.session_state.orders[name] = ""
+    st.session_state.selected_order = name
+
+
+def replace_order_rows(name: str, rows: List[Dict[str, Any]]) -> None:
+    new_df = pd.DataFrame(rows, columns=MASTER_COLUMNS)
+    if has_master():
+        keep = st.session_state.df_master[st.session_state.df_master["Order"].astype(str) != name]
+        new_df = pd.concat([keep, new_df], ignore_index=True)
+    st.session_state.decided = {
+        k: v for k, v in st.session_state.decided.items() if not k.startswith(f"{name}|")
+    }
+    set_master_df(new_df)
+
+
+def remove_order(name: str) -> None:
+    st.session_state.orders.pop(name, None)
+    st.session_state.order_issues.pop(name, None)
+    if has_master():
+        keep = st.session_state.df_master[st.session_state.df_master["Order"].astype(str) != name]
+        st.session_state.decided = {
+            k: v for k, v in st.session_state.decided.items() if not k.startswith(f"{name}|")
+        }
+        set_master_df(keep.reset_index(drop=True))
+    st.session_state.selected_order = ""
+
+
+def rename_order(old: str) -> None:
+    key = f"ordname_{st.session_state.job_id}_{old}"
+    new = clean_str(st.session_state.get(key))
+    if not new or new == old or new in order_names():
         return
 
-    st.caption(
-        "Edit Mode, Orientation, Split Rows/Cols, Depth and Weight as needed. New rows: enter Order, Mark, W, H "
-        "and Type, then click Save; ID, depth and weight are filled in automatically."
-    )
+    st.session_state.orders = {(new if k == old else k): v for k, v in st.session_state.orders.items()}
+    if old in st.session_state.order_issues:
+        st.session_state.order_issues[new] = st.session_state.order_issues.pop(old)
+    st.session_state.decided = {
+        (new + k[len(old):] if k.startswith(old + "|") else k): v for k, v in st.session_state.decided.items()
+    }
 
+    if has_master():
+        df = st.session_state.df_master.copy()
+        df.loc[df["Order"].astype(str) == old, "Order"] = new
+        for col in ("ID", "Orig"):
+            df[col] = df[col].map(lambda s: new + str(s)[len(old):] if str(s).startswith(old + "|") else s)
+        set_master_df(df)
+    st.session_state.selected_order = new
+
+
+def render_paste_editor(name: str) -> None:
+    job = st.session_state.job_id
+    text = st.text_area(
+        "One unit per line: mark, width, height, type, quantity (inches)",
+        value=st.session_state.orders.get(name, ""),
+        height=170,
+        key=f"paste_{job}_{name}",
+        placeholder="A1, 36, 72, Fixed, 2\nD1, 96, 108, Lift and slide, 1",
+    )
+    if st.button("Read units", type="primary", key=f"read_{job}_{name}"):
+        st.session_state.orders[name] = text
+        rows, issues = parse_order_text_to_rows(name, text, st.session_state.assumptions)
+        replace_order_rows(name, rows)
+        st.session_state.order_issues[name] = validation_issues_to_df(issues)
+        st.rerun()
+
+
+def render_upload_editor(name: str) -> None:
+    job = st.session_state.job_id
+    uploaded_file = st.file_uploader(
+        "Upload CSV or Excel", type=["csv", "xlsx", "xlsm", "xls"], key=f"upload_{job}_{name}",
+    )
+    if uploaded_file is None:
+        return
+
+    try:
+        uploaded_df = read_uploaded_dataframe(uploaded_file)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not read the file: {e}")
+        return
+
+    columns = [str(col) for col in uploaded_df.columns]
+    uploaded_df.columns = columns
+    options = ["<none>"] + columns
+    default_mapping = build_default_column_mapping(columns)
+    needs_check = any(default_mapping.get(k, "<none>") == "<none>" for k in ("id", "width", "height"))
+
+    mapping: Dict[str, str] = {}
+    with st.expander("Check the columns" + (" (some were not found)" if needs_check else ""), expanded=needs_check):
+        def pick(label: str, logical: str, container) -> str:
+            default_col = default_mapping.get(logical, "<none>")
+            return container.selectbox(
+                label, options, index=options.index(default_col) if default_col in options else 0,
+                key=f"map_{logical}_{job}_{name}_{uploaded_file.name}",
+            )
+
+        m1, m2 = st.columns(2)
+        mapping["id"] = pick("ID or mark", "id", m1)
+        mapping["width"] = pick("Width (in)", "width", m1)
+        mapping["height"] = pick("Height (in)", "height", m1)
+        mapping["type"] = pick("Type or system", "type", m1)
+        mapping["qty"] = pick("Quantity", "qty", m2)
+        mapping["depth"] = pick("Depth (in)", "depth", m2)
+        mapping["weight"] = pick("Weight (lbs)", "weight", m2)
+        mapping["notes"] = pick("Notes", "notes", m2)
+        st.dataframe(uploaded_df.head(8), **ui.STRETCH)
+
+    missing = [k for k in ("id", "width", "height") if mapping.get(k, "<none>") == "<none>"]
+    if st.button("Import file", type="primary", key=f"import_{job}_{name}", disabled=bool(missing)):
+        rows, issues = normalize_uploaded_table(
+            uploaded_df, name, mapping, st.session_state.assumptions, uploaded_file.name,
+        )
+        replace_order_rows(name, rows)
+        st.session_state.order_issues[name] = validation_issues_to_df(issues)
+        st.rerun()
+    if missing:
+        st.caption(f"Choose the column for: {', '.join(missing)}.")
+
+
+def render_order_preview(name: str) -> None:
+    if not has_master():
+        return
+
+    sub = st.session_state.df_master[st.session_state.df_master["Order"].astype(str) == name]
+    issues = st.session_state.order_issues.get(name)
+
+    if sub.empty:
+        if issues is None:
+            st.caption("No units read yet.")
+        else:
+            st.error("No valid units were found.")
+    else:
+        st.success(f"{len(sub)} unit{'s' if len(sub) != 1 else ''} read")
+
+    if issues is not None and not issues.empty:
+        st.warning(f"{len(issues)} line{'s' if len(issues) != 1 else ''} could not be read.")
+        shown = [c for c in ["row_no", "item_id", "problem", "suggestion", "raw_value"] if c in issues.columns]
+        st.dataframe(issues[shown], hide_index=True, **ui.STRETCH)
+
+    if sub.empty:
+        return
+
+    table = sub.groupby("Orig", sort=False).agg(
+        Mark=("Mark", "first"), Width=("W", "first"), Height=("H", "first"),
+        Type=("Type", "first"), Qty=("ID", "count"), Weight=("Lbs", "first"),
+    ).reset_index(drop=True)
+    table = table.rename(columns={"Width": "Width (in)", "Height": "Height (in)", "Weight": "Weight each (lbs)"})
+    st.dataframe(table.round(1).head(60), hide_index=True, **ui.STRETCH)
+    if len(table) > 60:
+        st.caption(f"{len(table) - 60} more rows not shown.")
+
+
+def render_step_units() -> None:
+    job = st.session_state.job_id
+    project_name = st.session_state.project.project_name or "This job"
+    ui.headline("Add the units", f"{project_name}. Add each order in the shipment, then paste or upload its units.")
+
+    if not order_names():
+        st.session_state.orders["Order 1"] = ""
+    names = order_names()
+    if st.session_state.selected_order not in names:
+        st.session_state.selected_order = names[0]
+    selected = st.session_state.selected_order
+
+    left, right = st.columns([1, 3], gap="large")
+
+    with left:
+        st.markdown("**Orders in this job**")
+        for n in names:
+            count = order_unit_count(n)
+            st.button(
+                f"{n}  ({count} unit{'s' if count != 1 else ''})", key=f"sel_{job}_{n}",
+                type="primary" if n == selected else "secondary",
+                on_click=select_order, args=(n,), **ui.STRETCH,
+            )
+        st.button("Add order", key=f"add_order_{job}", on_click=add_order, **ui.STRETCH)
+        st.caption("Orders stay in separate crates unless you change that in Advanced settings.")
+
+    with right:
+        with st.container(border=True):
+            top = st.columns([3, 1], vertical_alignment="bottom")
+            top[0].text_input(
+                "Order name", value=selected, key=f"ordname_{job}_{selected}",
+                on_change=rename_order, args=(selected,),
+            )
+            top[1].button(
+                "Remove order", key=f"rm_{job}_{selected}", on_click=remove_order, args=(selected,),
+                disabled=len(names) == 1 and order_unit_count(selected) == 0, **ui.STRETCH,
+            )
+
+            source = st.radio(
+                "Source", ["Paste", "Upload file"], horizontal=True, key=f"src_{job}_{selected}",
+                label_visibility="collapsed",
+            )
+            if source == "Paste":
+                render_paste_editor(selected)
+            else:
+                render_upload_editor(selected)
+
+            render_order_preview(selected)
+
+    total = int(len(st.session_state.df_master)) if has_master() else 0
+    lbs = float(st.session_state.df_master["Lbs"].astype(float).sum()) if has_master() else 0.0
+    order_count = int(st.session_state.df_master["Order"].nunique()) if has_master() else 0
+
+    with st.container(border=True):
+        bar = st.columns([1, 1, 1.4, 1, 1.6], vertical_alignment="center")
+        bar[0].metric("Units", total)
+        bar[1].metric("Orders", order_count)
+        bar[2].metric("Estimated weight", pounds_text(lbs))
+        bar[3].button("Back", on_click=go_step, args=(0,), key="units_back", **ui.STRETCH)
+        bar[4].button("Check the units", type="primary", on_click=go_step, args=(2,), key="units_next",
+                      disabled=total == 0, **ui.STRETCH)
+
+
+# ==========================================================
+# 24. STEP 3: REVIEW
+# ==========================================================
+
+def unit_title(g: Dict[str, Any]) -> str:
+    n = g["count"]
+    return f"{g['mark']}, {g['type']}, {n} unit{'s' if n != 1 else ''}"
+
+
+def unit_detail(g: Dict[str, Any], multi_order: bool) -> str:
+    text = f'{g["w"]:.0f} in by {g["h"]:.0f} in, {g["lbs"]:,.0f} lbs each'
+    return f"{g['order']}. {text}" if multi_order else text
+
+
+def render_review_group(
+    g: Dict[str, Any],
+    vehicle_data: Dict[str, float],
+    a: LogisticsAssumptions,
+    lim: TransportLimits,
+    multi_order: bool,
+) -> None:
+    resolved = g["kind"] == "resolved"
+    job = st.session_state.job_id
+
+    with st.container(border=True):
+        head = st.columns([4, 1.6], vertical_alignment="center")
+        head[0].markdown(f"**{unit_title(g)}**  \n<span style='color:#6e6e73;font-size:.88rem'>{_html.escape(unit_detail(g, multi_order))}</span>",
+                         unsafe_allow_html=True)
+        if resolved:
+            head[1].markdown(ui.pill("Decided", "good"), unsafe_allow_html=True)
+        elif g["severity"] == "ERROR" or g["default_cls"] == CLASS_OVERSIZE:
+            head[1].markdown(ui.pill("Cannot ship as entered", "bad"), unsafe_allow_html=True)
+        else:
+            head[1].markdown(ui.pill("Needs your choice", "warn"), unsafe_allow_html=True)
+
+        if g["default_cls"] == CLASS_OVERSIZE:
+            st.caption(
+                f'Even on its side it is {in_to_mm(min(g["w"], g["h"])):,.0f} mm tall, '
+                f"over the {in_to_mm(lim.slant_max_v):,.0f} mm limit."
+            )
+        elif g["default_cls"] == CLASS_LOW and not resolved:
+            st.caption("By default it goes on a low-floor pallet and the glass ships separately.")
+        elif g["problem"] and not resolved:
+            st.caption(g["problem"])
+
+        opts = g["options"]
+        texts = {o: option_text(o, g, lim, a) for o in opts}
+        by_label = {texts[o][0]: o for o in opts}
+        label_list = [texts[o][0] for o in opts]
+        index = opts.index(g["current"]) if resolved and g["current"] in opts else None
+        key = f"choice_{job}_{g['orig']}_{st.session_state.editor_version}"
+
+        kwargs: Dict[str, Any] = dict(index=index, key=key, label_visibility="collapsed")
+        try:
+            picked = st.radio("How should it ship?", label_list, captions=[texts[o][1] for o in opts], **kwargs)
+        except TypeError:
+            picked = st.radio("How should it ship?", label_list, **kwargs)
+        choice = by_label.get(picked) if picked else None
+
+        if choice and choice != (g["current"] if resolved else None):
+            apply_unit_choice(g["orig"], choice, vehicle_data, a)
+            st.rerun()
+
+        if resolved and g["severity"] == "ERROR":
+            st.error(g["problem"] or "This choice still does not fit.")
+
+
+def render_edit_all_rows() -> None:
+    st.caption(
+        "Edit Mode, Orientation, Split Rows/Cols, Depth and Weight directly. New rows: enter Order, Mark, W, H "
+        "and Type, then save; ID, depth and weight are filled in automatically."
+    )
     current_master = st.session_state.df_master.copy()
     for col in MASTER_COLUMNS:
         if col not in current_master.columns:
@@ -3482,14 +4053,11 @@ def render_tab_edit() -> None:
     edited_df = st.data_editor(
         current_master,
         key=f"master_data_editor_{st.session_state.editor_version}",
-        **ui.STRETCH,
         hide_index=True,
         num_rows="dynamic",
         column_config={
-            "Mode": st.column_config.SelectboxColumn("Mode", options=["WHOLE", "SLANT", "DISASSEMBLED"],
-                                                     default="WHOLE"),
-            "Orient": st.column_config.SelectboxColumn("Orientation", options=["AUTO", "UPRIGHT", "SIDE"],
-                                                       default="AUTO"),
+            "Mode": st.column_config.SelectboxColumn("Mode", options=["WHOLE", "SLANT", "DISASSEMBLED"], default="WHOLE"),
+            "Orient": st.column_config.SelectboxColumn("Orientation", options=["AUTO", "UPRIGHT", "SIDE"], default="AUTO"),
             "SR": st.column_config.NumberColumn("Split Rows", min_value=1, step=1, default=1),
             "SC": st.column_config.NumberColumn("Split Cols", min_value=1, step=1, default=1),
             "W": st.column_config.NumberColumn("Width", min_value=0.01, step=0.125, format="%.3f"),
@@ -3499,403 +4067,333 @@ def render_tab_edit() -> None:
             "Qty": st.column_config.NumberColumn("Qty", disabled=True),
         },
         disabled=["ID", "Orig", "Source", "Qty"],
+        **ui.STRETCH,
     )
 
-    normalized_edit = normalize_master_df(edited_df, st.session_state.assumptions)
+    if st.button("Save edited rows", type="primary", key="save_rows_btn"):
+        set_master_df(normalize_master_df(edited_df, st.session_state.assumptions))
+        st.rerun()
 
-    c_save, c_validate, c_clear = st.columns(3)
 
-    with c_save:
-        if st.button("Save Edited Master Table", type="primary", **ui.STRETCH):
-            set_master_df(normalized_edit)
-            st.session_state.last_validation_df = validation_issues_to_df(
-                validate_master_dataframe(normalized_edit)
-            )
-            st.rerun()
+def render_step_review() -> None:
+    a = st.session_state.assumptions
+    vehicle_data = current_vehicle_data()
 
-    with c_validate:
-        if st.button("Validate Current Edits", **ui.STRETCH):
-            st.session_state.last_validation_df = validation_issues_to_df(
-                validate_master_dataframe(normalized_edit)
-            )
-            st.success("Validation complete. Save to keep the edits.")
+    master = normalize_master_df(st.session_state.df_master, a)
+    problems = validate_master_dataframe(master)
+    if any(issue.severity == "ERROR" for issue in problems):
+        ui.headline("Fix the data first", "Some rows cannot be used as entered.")
+        st.dataframe(validation_issues_to_df(problems), hide_index=True, **ui.STRETCH)
+        with st.expander("Edit all rows", expanded=True):
+            render_edit_all_rows()
+        st.button("Back to units", on_click=go_step, args=(1,), key="review_back_err")
+        return
 
-    with c_clear:
-        if st.button("Clear Master Table", **ui.STRETCH):
-            set_master_df(pd.DataFrame(columns=MASTER_COLUMNS))
-            st.session_state.last_validation_df = pd.DataFrame()
-            st.session_state.unit_issue_df = pd.DataFrame()
-            st.rerun()
+    review = build_review(master, vehicle_data, a, st.session_state.decided)
+    lim: TransportLimits = review["limits"]
+    groups = review["groups"]
+    left = review["decisions_left"]
+    total = review["total_units"]
+    multi_order = master["Order"].astype(str).nunique() > 1
 
-    st.divider()
-    st.subheader("Validation Issues")
-    if st.session_state.last_validation_df is not None and not st.session_state.last_validation_df.empty:
-        st.dataframe(st.session_state.last_validation_df, **ui.STRETCH, hide_index=True)
+    if left:
+        ui.headline(f"{total} units checked, {left} decision{'s' if left != 1 else ''} left",
+                    "Only units that need your call are listed. Everything else is already set.")
     else:
-        st.success("No parsing/master-table validation issues currently stored.")
+        ui.headline(f"{total} units checked, all set", "Every unit has a way to ship. You can build the plan.")
 
-    st.divider()
-    st.subheader("Factory Transport Check (current edits)")
+    to_decide = [g for g in groups if g["kind"] == "decide"]
+    to_decide.sort(key=lambda g: 0 if (g["severity"] == "ERROR" or g["default_cls"] == CLASS_OVERSIZE) else 1)
+    resolved = [g for g in groups if g["kind"] == "resolved"]
+    notes = [g for g in groups if g["kind"] == "note"]
 
-    vehicle_data = st.session_state.vehicle_catalog[st.session_state.selected_vehicle]
-    issue_df = build_unit_issue_report(normalized_edit, vehicle_data, st.session_state.assumptions)
-    st.session_state.unit_issue_df = issue_df
-    show_issue_summary(issue_df)
+    if to_decide:
+        st.markdown("### Needs a decision")
+        for g in to_decide:
+            render_review_group(g, vehicle_data, a, lim, multi_order)
 
-    st.caption(
-        "Based on the selected vehicle's door height and the factory transport rules in the sidebar. "
-        "Changing the vehicle or rules can change the result."
+    if resolved:
+        st.markdown("### Your choices")
+        for g in resolved:
+            render_review_group(g, vehicle_data, a, lim, multi_order)
+
+    if notes:
+        st.markdown("### Ships with a note")
+        with st.container(border=True):
+            for g in notes:
+                row = st.columns([3, 5], vertical_alignment="center")
+                row[0].markdown(f"**{unit_title(g)}**")
+                row[1].caption(g["problem"])
+
+    with st.container(border=True):
+        row = st.columns([2, 5], vertical_alignment="center")
+        row[0].markdown(f"**Ships normally**  \n{ui.pill(f'{review['normal_units']} units', 'good')}", unsafe_allow_html=True)
+        row[1].caption("Standard pallets or crates, glass in the unit.")
+
+    with st.expander("Edit all rows", expanded=False):
+        render_edit_all_rows()
+
+    nav = st.columns([1.4, 4, 1.8])
+    nav[0].button("Back to units", on_click=go_step, args=(1,), key="review_back", **ui.STRETCH)
+    nav[2].button("Build the plan", type="primary", on_click=go_step, args=(3,), key="review_next",
+                  disabled=left > 0, **ui.STRETCH)
+
+
+# ==========================================================
+# 25. STEP 4: PLAN
+# ==========================================================
+
+def plan_cache_key(master: pd.DataFrame) -> str:
+    selected = st.session_state.selected_pallets
+    blob = json.dumps(
+        {
+            "m": master.to_dict("records"),
+            "a": asdict(st.session_state.assumptions),
+            "v": st.session_state.selected_vehicle,
+            "vd": current_vehicle_data(),
+            "p": selected,
+            "pc": {k: st.session_state.pallet_catalog.get(k) for k in selected},
+        },
+        sort_keys=True, default=str,
+    )
+    return hashlib.md5(blob.encode("utf-8")).hexdigest()
+
+
+def get_exports(result: Dict[str, Any]) -> Dict[str, Any]:
+    key = (st.session_state.results_key, not st.session_state.scenario_df.empty)
+    cache = st.session_state.export_cache
+    if cache and cache.get("key") == key:
+        return cache
+
+    cache = {"key": key}
+    try:
+        cache["pdf"] = generate_pdf_report(st.session_state.project, result)
+    except Exception as e:  # noqa: BLE001
+        cache["pdf_error"] = str(e)
+    try:
+        cache["xlsx"] = export_plan_to_excel_bytes(
+            st.session_state.project, st.session_state.df_master, st.session_state.unit_issue_df,
+            result, st.session_state.scenario_df,
+        )
+    except Exception as e:  # noqa: BLE001
+        cache["xlsx_error"] = str(e)
+    st.session_state.export_cache = cache
+    return cache
+
+
+def apply_scenario(strategy: str) -> None:
+    new_df = create_scenario_master_df(
+        st.session_state.df_master, strategy, current_vehicle_data(), st.session_state.assumptions,
+    )
+    set_master_df(new_df)
+
+
+def render_compare_options(result: Dict[str, Any]) -> None:
+    if st.session_state.scenario_df is None or st.session_state.scenario_df.empty:
+        with st.spinner("Comparing options"):
+            st.session_state.scenario_df = run_scenario_comparison(
+                st.session_state.df_master, st.session_state.vehicle_catalog, [st.session_state.selected_vehicle],
+                st.session_state.selected_pallets, st.session_state.pallet_catalog,
+                st.session_state.assumptions, SCENARIO_OPTIONS,
+            )
+
+    table = st.session_state.scenario_df
+    shown = table[["Scenario", "Status", "Containers", "Crates/Racks", "Pallets",
+                   "Low-Floor Pieces (no glass)", "Avg Floor Util %", "Unpacked Items"]].copy()
+    shown["Scenario"] = shown["Scenario"].replace({SCENARIO_CURRENT: "Your choices (this plan)"})
+    st.dataframe(shown, hide_index=True, **ui.STRETCH)
+
+    options = [s for s in SCENARIO_OPTIONS if s != SCENARIO_CURRENT]
+    row = st.columns([3, 1.4], vertical_alignment="bottom")
+    picked = row[0].selectbox("Try a different way to ship the oversized units", options, key="compare_pick")
+    if row[1].button("Use this option", key="compare_apply", **ui.STRETCH):
+        apply_scenario(picked)
+        st.rerun()
+    st.caption("Using an option changes how oversized and low-floor units ship. Units you split yourself stay as they are.")
+
+
+def render_plan_view(result: Dict[str, Any]) -> None:
+    project: ProjectMeta = st.session_state.project
+    manifest_df: pd.DataFrame = result["manifest_df"]
+    loads = result["loads"]
+    unpacked = result["final_overflow"]
+    counts = plan_class_counts(result)
+
+    bad = 0 if manifest_df.empty else int((manifest_df["Status"].astype(str) != "OK").sum())
+    packages = len(result["crates"]) + len(result["pallets"])
+    low = counts.get(CLASS_LOW, 0)
+
+    if unpacked or bad:
+        pill = ui.pill(f"{bad + len(unpacked)} item{'s' if bad + len(unpacked) != 1 else ''} need attention", "bad")
+    elif low:
+        pill = ui.pill("Fits, with restrictions", "warn")
+    else:
+        pill = ui.pill("Everything fits", "good")
+
+    glass_note = f"{low} piece{'s' if low != 1 else ''} ship without glass." if low else "All glass ships in the units."
+    ui.headline(
+        f"{len(loads)} container{'s' if len(loads) != 1 else ''}, {packages} package{'s' if packages != 1 else ''}",
+        f"{project.display_name()}, {result['vehicle_name']}. {glass_note}",
+        pill,
     )
 
-
-# ==========================================================
-# 24. TAB 3 — OPTIMIZE
-# ==========================================================
-
-def render_result_metrics(result: Dict[str, Any]) -> None:
-    manifest_df = result["manifest_df"]
-    loads = result["loads"]
-    counts = plan_class_counts(result)
+    exports = get_exports(result)
+    base_name = f"{today_file_stamp()}-{slugify(project.display_name())}-logistics"
+    dl = st.columns(3)
+    if "pdf" in exports:
+        dl[0].download_button("Download summary PDF", data=exports["pdf"], file_name=f"{base_name}-manifest.pdf",
+                              mime="application/pdf", type="primary", key="plan_pdf", **ui.STRETCH)
+    else:
+        dl[0].error(f"Could not make the PDF: {exports.get('pdf_error')}")
+    if "xlsx" in exports:
+        dl[1].download_button(
+            "Download Excel manifest", data=exports["xlsx"], file_name=f"{base_name}-manifest.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="plan_xlsx", **ui.STRETCH)
+    else:
+        dl[1].error(f"Could not make the workbook: {exports.get('xlsx_error')}")
+    dl[2].download_button(
+        "Download job file",
+        data=json_download_bytes(build_job_save_payload(
+            project, st.session_state.assumptions, st.session_state.orders, st.session_state.df_master,
+            st.session_state.selected_vehicle, st.session_state.selected_pallets,
+            extra={"job_id": st.session_state.job_id, "step": 3, "decided": st.session_state.decided},
+        )),
+        file_name=f"{base_name}.json", mime="application/json", key="plan_json", **ui.STRETCH)
 
     total_weight = float(manifest_df["Weight"].astype(float).sum()) if not manifest_df.empty else 0.0
     avg_util = sum(float(ld["util"]) for ld in loads) / len(loads) if loads else 0.0
-
-    m = st.columns(6)
-    m[0].metric("Total Weight", pounds_text(total_weight))
+    m = st.columns(4)
+    m[0].metric("Total weight", pounds_text(total_weight))
     m[1].metric("Containers", len(loads))
-    m[2].metric("Crates / Racks", len(result["crates"]))
-    m[3].metric("Pallets", len(result["pallets"]))
-    m[4].metric("Avg Floor Util", f"{avg_util:.1f}%")
-    m[5].metric("Unpacked", len(result["final_overflow"]))
+    m[2].metric("Average floor use", f"{avg_util:.0f}%")
+    m[3].metric("Not loaded", len(unpacked))
 
-    n = st.columns(5)
-    n[0].metric("Standard pieces", counts.get(CLASS_STD, 0))
-    n[1].metric("Low-floor (no glass)", counts.get(CLASS_LOW, 0))
-    n[2].metric("Slant rack", counts.get(CLASS_SLANT, 0))
-    n[3].metric("Disassembled parts", counts.get(CLASS_DIS, 0))
-    n[4].metric("Oversize", counts.get(CLASS_OVERSIZE, 0))
+    if unpacked:
+        st.error(f"{len(unpacked)} package(s) could not be loaded into this vehicle.")
+        st.dataframe(pd.DataFrame(unpacked), hide_index=True, **ui.STRETCH)
+    if bad:
+        st.warning(f"{bad} package(s) have status warnings.")
+        st.dataframe(manifest_df[manifest_df["Status"].astype(str) != "OK"], hide_index=True, **ui.STRETCH)
 
+    st.markdown("### Compare ways to ship")
+    render_compare_options(result)
 
-def render_tab_optimize() -> None:
-    st.header("Optimize Load Plan")
-
-    if not has_master():
-        st.info("Load and validate data first.")
-        return
-
-    vehicle_name = st.session_state.selected_vehicle
-    vehicle_data = st.session_state.vehicle_catalog[vehicle_name]
-    assumptions = st.session_state.assumptions
-    lim = current_limits()
-
-    c = st.columns(5)
-    c[0].metric("Vehicle", vehicle_name)
-    c[1].metric("Loading Height Limit", inches_text(lim.vehicle_limit_h))
-    c[2].metric("Std Pallet Unit Max", f"{in_to_mm(lim.std_max_v):,.0f} mm")
-    c[3].metric("Low-Floor Unit Max", f"{in_to_mm(lim.low_floor_max_v):,.0f} mm")
-    c[4].metric("Slant Unit Max", f"{in_to_mm(lim.slant_max_v):,.0f} mm")
-
-    st.warning(assumptions.planning_warning)
-
-    st.subheader("Pre-Optimization Checks")
-    validation_issues = validate_master_dataframe(normalize_master_df(st.session_state.df_master, assumptions))
-    validation_df = validation_issues_to_df(validation_issues)
-
-    if not validation_df.empty:
-        st.markdown("#### Master Table Validation")
-        st.dataframe(validation_df, **ui.STRETCH, hide_index=True)
-
-    unit_issue_df = build_unit_issue_report(st.session_state.df_master, vehicle_data, assumptions)
-    st.markdown("#### Factory Transport Check")
-    show_issue_summary(unit_issue_df)
-
-    blocking = any(issue.severity == "ERROR" for issue in validation_issues)
-    if blocking:
-        st.error("Fix validation errors before optimizing.")
-
-    st.divider()
-    c_opt, c_reset = st.columns([2, 1])
-    with c_opt:
-        optimize_clicked = st.button("Optimize Load", type="primary", **ui.STRETCH, disabled=blocking)
-    with c_reset:
-        if st.button("Clear Results", **ui.STRETCH):
-            clear_results()
-            st.success("Results cleared.")
-
-    if optimize_clicked:
-        plan = build_logistics_plan(
-            st.session_state.df_master, vehicle_name, vehicle_data,
-            st.session_state.selected_pallets, st.session_state.pallet_catalog, assumptions,
-        )
-        if not plan.get("ok"):
-            st.session_state.results = None
-            st.error(plan.get("message", "Optimization failed."))
-            if "errors" in plan:
-                st.dataframe(plan["errors"], **ui.STRETCH, hide_index=True)
-        else:
-            st.session_state.results = plan
-            st.session_state.unit_issue_df = unit_issue_df
-            st.success("Optimization complete.")
-
-    st.divider()
-
-    result = st.session_state.results
-    if not result:
-        return
-
-    render_result_metrics(result)
-
-    if result["final_overflow"]:
-        st.error(f"{len(result['final_overflow'])} package(s) could not be loaded into the selected vehicle.")
-        st.dataframe(pd.DataFrame(result["final_overflow"]), **ui.STRETCH, hide_index=True)
-
-    manifest_df = result["manifest_df"]
-    if not manifest_df.empty:
-        bad = manifest_df[manifest_df["Status"].astype(str) != "OK"]
-        if not bad.empty:
-            st.warning(f"{len(bad)} package(s) have status warnings.")
-            st.dataframe(bad, **ui.STRETCH, hide_index=True)
-
-    st.subheader("Container Load Summary")
-    st.dataframe(result["load_summary_df"], **ui.STRETCH, hide_index=True)
-
-
-# ==========================================================
-# 25. TAB 4 — RESULTS & EXPORT
-# ==========================================================
-
-def render_tab_results() -> None:
-    st.header("Results & Export")
-
-    result = st.session_state.results
-    if not result:
-        st.info("Run optimization first.")
-        return
-
-    render_result_metrics(result)
-    st.warning(result["assumptions"].planning_warning)
-    st.divider()
-
-    st.subheader("Package Manifest")
-    st.dataframe(result["manifest_df"], **ui.STRETCH, hide_index=True)
-
-    st.subheader("Container Load Summary")
-    st.dataframe(result["load_summary_df"], **ui.STRETCH, hide_index=True)
-
-    st.subheader("Packing Decisions")
-    st.dataframe(result["decision_df"], **ui.STRETCH, hide_index=True)
-
-    if result["packing_notes_df"] is not None and not result["packing_notes_df"].empty:
-        with st.expander("Packing Notes", expanded=False):
-            st.dataframe(result["packing_notes_df"], **ui.STRETCH, hide_index=True)
-
-    st.divider()
-    st.subheader("Container Plans")
-
-    loads = result["loads"]
+    st.markdown("### Container floor plan")
     vehicle_data = result["vehicle_data"]
-
     if loads:
-        selected_no = st.selectbox(
-            "View Container", [load["container_no"] for load in loads], key="results_container_select",
-        )
-        selected_load = next(load for load in loads if load["container_no"] == selected_no)
-
+        numbers = [load["container_no"] for load in loads]
+        selected_no = numbers[0]
+        if len(numbers) > 1:
+            cont_labels = {f"Container {n}": n for n in numbers}
+            selected_no = cont_labels[st.radio("Container", list(cont_labels.keys()), horizontal=True,
+                                               key="plan_container")]
+        load = next(ld for ld in loads if ld["container_no"] == selected_no)
         st.caption(
-            f"{result['vehicle_name']} — Container #{selected_no} — "
-            f"Utilization: {selected_load['util']:.1f}% — "
-            f"Weight: {pounds_text(float(selected_load.get('weight', 0)))}"
-        )
-
-        st.plotly_chart(
-            build_2d_plan(
-                selected_load["placed"], float(vehicle_data["L"]), float(vehicle_data["W"]),
-                result["order_color_map"], title_text=f"Container #{selected_no} 2D Plan",
-            ),
-            **ui.STRETCH,
-            key=f"plan2d_{selected_no}",
+            f"{result['vehicle_name']}, container {selected_no}: {len(load['placed'])} packages, "
+            f"{pounds_text(float(load.get('weight', 0)))}, {load['util']:.0f}% of the floor. "
+            "Colours show the order each package belongs to."
         )
         st.plotly_chart(
-            build_3d_plan(selected_load, result, vehicle_data, result["order_color_map"]),
-            **ui.STRETCH,
-            key=f"plan3d_{selected_no}",
+            build_2d_plan(load["placed"], float(vehicle_data["L"]), float(vehicle_data["W"]),
+                          result["order_color_map"], title_text=f"Container {selected_no}"),
+            key=f"plan2d_{selected_no}", **ui.STRETCH,
         )
 
-    if result.get("final_overflow"):
-        st.subheader("Unpacked Packages")
-        st.error(f"{len(result['final_overflow'])} package(s) could not be loaded.")
-        st.dataframe(pd.DataFrame(result["final_overflow"]), **ui.STRETCH, hide_index=True)
-
-    st.divider()
-    st.subheader("Exports")
-
-    base_name = f"{today_file_stamp()}-{slugify(st.session_state.project.display_name())}-logistics-manifest"
-    col_pdf, col_xlsx, col_json = st.columns(3)
-
-    with col_pdf:
-        try:
-            st.download_button(
-                "Download PDF Manifest",
-                data=generate_pdf_report(st.session_state.project, result),
-                file_name=f"{base_name}.pdf",
-                mime="application/pdf",
-                **ui.STRETCH,
-                key="results_pdf_download",
-            )
-        except Exception as e:  # noqa: BLE001
-            st.error(f"Could not generate PDF: {e}")
-
-    with col_xlsx:
-        try:
-            st.download_button(
-                "Download Excel Workbook",
-                data=export_plan_to_excel_bytes(
-                    st.session_state.project, st.session_state.df_master, st.session_state.unit_issue_df,
-                    result, st.session_state.scenario_df,
-                ),
-                file_name=f"{base_name}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                **ui.STRETCH,
-                key="results_xlsx_download",
-            )
-        except Exception as e:  # noqa: BLE001
-            st.error(f"Could not generate Excel workbook: {e}")
-
-    with col_json:
-        st.download_button(
-            "Download Job JSON",
-            data=json_download_bytes(
-                build_job_save_payload(
-                    st.session_state.project, st.session_state.assumptions, st.session_state.orders,
-                    st.session_state.df_master, st.session_state.selected_vehicle,
-                    st.session_state.selected_pallets,
-                )
-            ),
-            file_name=f"{base_name}.json",
-            mime="application/json",
-            **ui.STRETCH,
-            key="results_json_download",
+        st.markdown("### 3D view")
+        st.caption("Drag to rotate, scroll to zoom. Slanted units lean back inside their rack.")
+        st.plotly_chart(
+            build_3d_plan(load, result, vehicle_data, result["order_color_map"]),
+            key=f"plan3d_{selected_no}", **ui.STRETCH,
         )
 
+    with st.expander("Packages and packing decisions", expanded=False):
+        st.markdown("**Package manifest**")
+        st.dataframe(manifest_df, hide_index=True, **ui.STRETCH)
+        st.markdown("**Container load summary**")
+        st.dataframe(result["load_summary_df"], hide_index=True, **ui.STRETCH)
+        st.markdown("**Packing decisions**")
+        st.dataframe(result["decision_df"], hide_index=True, **ui.STRETCH)
+        notes = result.get("packing_notes_df")
+        if notes is not None and not notes.empty:
+            st.markdown("**Packing notes**")
+            st.dataframe(notes, hide_index=True, **ui.STRETCH)
 
-# ==========================================================
-# 26. TAB 5 — SCENARIOS
-# ==========================================================
+    st.caption(result["assumptions"].planning_warning)
 
-def render_tab_scenarios() -> None:
-    st.header("Scenario Comparison")
 
-    if not has_master():
-        st.info("Load unit data first.")
+def render_step_plan() -> None:
+    a = st.session_state.assumptions
+    vehicle_data = current_vehicle_data()
+    master = normalize_master_df(st.session_state.df_master, a)
+    review = build_review(master, vehicle_data, a, st.session_state.decided)
+
+    if review["decisions_left"]:
+        n = review["decisions_left"]
+        ui.headline("One more step", f"{n} unit{'s' if n != 1 else ''} still need a decision before the plan can be built.")
+        st.button("Go to review", type="primary", on_click=go_step, args=(2,), key="plan_to_review")
         return
 
-    st.caption("Compare vehicles and handling strategies before committing to the final plan.")
-
-    selected_vehicle_names = st.multiselect(
-        "Vehicles to Compare",
-        list(st.session_state.vehicle_catalog.keys()),
-        default=[st.session_state.selected_vehicle],
-    )
-    selected_strategy_names = st.multiselect(
-        "Strategies to Compare",
-        SCENARIO_OPTIONS,
-        default=SCENARIO_OPTIONS,
-        help=(
-            "Strategies only change units that do not fit a standard pallet as currently set, "
-            "and never override a split you entered yourself."
-        ),
-    )
-
-    st.caption(
-        "Scenario comparison is a planning aid. It does not replace final review of handling rules, "
-        "crate construction, carrier requirements, or factory packing constraints."
-    )
-
-    if st.button("Run Scenario Comparison", type="primary", **ui.STRETCH):
-        if not selected_vehicle_names:
-            st.error("Select at least one vehicle.")
-        elif not selected_strategy_names:
-            st.error("Select at least one strategy.")
-        else:
-            st.session_state.scenario_df = run_scenario_comparison(
-                st.session_state.df_master,
-                st.session_state.vehicle_catalog,
-                selected_vehicle_names,
-                st.session_state.selected_pallets,
-                st.session_state.pallet_catalog,
-                st.session_state.assumptions,
-                selected_strategy_names,
+    key = plan_cache_key(master)
+    result = st.session_state.results
+    if not result or st.session_state.results_key != key:
+        with st.spinner("Building the plan"):
+            plan = build_logistics_plan(
+                master, st.session_state.selected_vehicle, vehicle_data,
+                st.session_state.selected_pallets, st.session_state.pallet_catalog, a,
             )
-            st.success("Scenario comparison complete.")
+        if not plan.get("ok"):
+            st.error(plan.get("message", "The plan could not be built."))
+            if "errors" in plan:
+                st.dataframe(plan["errors"], hide_index=True, **ui.STRETCH)
+            st.button("Back to review", on_click=go_step, args=(2,), key="plan_back_err")
+            return
+        st.session_state.results = plan
+        st.session_state.results_key = key
+        st.session_state.export_cache = None
+        st.session_state.unit_issue_df = review["issue_df"]
+        result = plan
 
-    scenario_df = st.session_state.scenario_df
-    if scenario_df is None or scenario_df.empty:
-        st.info("Run a scenario comparison to see results and enable export.")
-        return
+    render_plan_view(result)
 
-    st.subheader("Scenario Results")
-    st.dataframe(scenario_df, **ui.STRETCH, hide_index=True)
-
-    st.markdown("#### Best-Looking Options")
-    usable = scenario_df[scenario_df["Status"] != "ERROR"].copy()
-
-    if usable.empty:
-        st.warning("No usable scenario results found.")
-    else:
-        status_rank = {"OK": 0, "OK - RESTRICTIONS": 1, "REVIEW": 2}
-        usable["_status_rank"] = usable["Status"].map(status_rank).fillna(3)
-        for col in ["Containers", "Unpacked Items", "Avg Floor Util %", "Low-Floor Pieces (no glass)"]:
-            usable[col] = pd.to_numeric(usable[col], errors="coerce")
-
-        usable = usable.sort_values(
-            by=["Unpacked Items", "_status_rank", "Containers", "Low-Floor Pieces (no glass)", "Avg Floor Util %"],
-            ascending=[True, True, True, True, False],
-        ).drop(columns=["_status_rank"])
-
-        st.dataframe(usable.head(10), **ui.STRETCH, hide_index=True)
-
-    st.download_button(
-        "Download Scenario CSV",
-        data=scenario_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"{today_file_stamp()}-{slugify(st.session_state.project.display_name())}-scenario-comparison.csv",
-        mime="text/csv",
-        **ui.STRETCH,
-        key="scenario_csv_download",
-    )
+    st.button("Back to review", on_click=go_step, args=(2,), key="plan_back")
 
 
 # ==========================================================
-# 27. MAIN
+# 26. MAIN
 # ==========================================================
 
 def main() -> None:
-    st.set_page_config(page_title=APP_NAME, page_icon="📦", layout="wide")
+    st.set_page_config(page_title=APP_NAME, page_icon="📦", layout="wide", initial_sidebar_state="collapsed")
     ui.apply_theme()
     init_session_state()
     check_password()
 
-    ui.page_header(APP_NAME, "Crating and container load planning")
-    render_sidebar()
+    render_topbar()
 
-    tab_input, tab_edit, tab_optimize, tab_results, tab_scenarios = st.tabs(
-        ["Data Input", "Edit & Validate", "Optimize", "Results & Export", "Scenarios"]
-    )
+    if not st.session_state.job_id:
+        render_home()
+    else:
+        render_stepper()
+        step = st.session_state.step
 
-    with tab_input:
-        render_tab_input()
-    with tab_edit:
-        render_tab_edit()
-    with tab_optimize:
-        render_tab_optimize()
-    with tab_results:
-        render_tab_results()
-    with tab_scenarios:
-        render_tab_scenarios()
+        if step in (2, 3) and not has_master():
+            ui.headline("Add units first", "There is nothing to check yet.")
+            st.button("Go to units", type="primary", on_click=go_step, args=(1,), key="need_units")
+        elif step == 0:
+            render_step_job()
+        elif step == 1:
+            render_step_units()
+        elif step == 2:
+            render_step_review()
+        else:
+            render_step_plan()
+
+        save_current_job()
 
     st.divider()
     st.caption(
-        f"{APP_NAME} {APP_VERSION} — planning tool only. Final crate design, glass handling, blocking/bracing, "
-        "freight loading, payload, route restrictions, and carrier requirements must be verified before shipment."
+        f"{APP_NAME} {APP_VERSION}. Planning tool only. Final crate design, glass handling, blocking and bracing, "
+        "freight loading, payload, route restrictions and carrier requirements must be verified before shipment."
     )
 
 

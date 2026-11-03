@@ -119,6 +119,18 @@ overflow:hidden;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.04)}
 [data-testid="stPlotlyChart"]{background:#fff;border:1px solid var(--u-line-soft);border-radius:14px;padding:6px;
 box-shadow:0 1px 2px rgba(0,0,0,.04)}
 
+
+/* ---- pills and headlines ---- */
+.u-pill{display:inline-flex;align-items:center;height:26px;padding:0 10px;border-radius:13px;font-size:13px;font-weight:600;white-space:nowrap}
+.u-pill-good{background:rgba(52,199,89,.18);color:#1b6f31}
+.u-pill-warn{background:rgba(255,159,10,.18);color:#8a5000}
+.u-pill-bad{background:rgba(255,59,48,.14);color:#b3001a}
+.u-pill-neutral{background:rgba(118,118,128,.14);color:#3a3a3c}
+.u-h1{font-size:2rem;font-weight:700;letter-spacing:-.03em;line-height:1.15;margin:.2rem 0 0;color:var(--u-ink)}
+.u-lead{font-size:1rem;color:var(--u-ink-2);margin:.35rem 0 1rem;max-width:46rem;line-height:1.5}
+.stApp [data-testid="stVerticalBlockBorderWrapper"]{border-radius:14px}
+[data-testid="stSegmentedControl"]{margin-bottom:1rem}
+
 /* ---- alerts: soft tinted pills ---- */
 [data-testid="stAlert"]{border-radius:var(--u-radius);border:none}
 [data-testid="stAlert"][data-baseweb="notification"]{border-radius:var(--u-radius)}
@@ -208,3 +220,16 @@ def style_fig(fig, height: Optional[int] = None):
     if height:
         fig.update_layout(height=height)
     return fig
+
+
+def pill(text: str, tone: str = "neutral") -> str:
+    """Small status pill as HTML (use with unsafe_allow_html=True)."""
+    tone = tone if tone in ("good", "warn", "bad", "neutral") else "neutral"
+    return f'<span class="u-pill u-pill-{tone}">{_html.escape(str(text))}</span>'
+
+
+def headline(title: str, subtitle: str = "", pill_html: str = "") -> None:
+    """Large step heading with an optional lead sentence and status pill above it."""
+    lead = f'<div class="u-lead">{_html.escape(subtitle)}</div>' if subtitle else ""
+    top = f'<div style="margin-bottom:.4rem">{pill_html}</div>' if pill_html else ""
+    st.markdown(f'{top}<h1 class="u-h1">{_html.escape(title)}</h1>{lead}', unsafe_allow_html=True)
