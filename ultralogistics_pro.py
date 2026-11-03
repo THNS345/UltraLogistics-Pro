@@ -4127,7 +4127,8 @@ def render_step_review() -> None:
 
     with st.container(border=True):
         row = st.columns([2, 5], vertical_alignment="center")
-        row[0].markdown(f"**Ships normally**  \n{ui.pill(f'{review['normal_units']} units', 'good')}", unsafe_allow_html=True)
+        normal_pill = ui.pill(f"{review['normal_units']} units", "good")
+        row[0].markdown(f"**Ships normally**  \n{normal_pill}", unsafe_allow_html=True)
         row[1].caption("Standard pallets or crates, glass in the unit.")
 
     with st.expander("Edit all rows", expanded=False):
