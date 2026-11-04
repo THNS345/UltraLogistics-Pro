@@ -45,7 +45,7 @@ from reportlab.platypus import (
 # Run with:  streamlit run ultralogistics_pro.py
 # ==========================================================
 
-APP_NAME = "UltraLogistics Pro"
+APP_NAME = "EAS Logistics"
 APP_VERSION = "2026-10-02"
 
 
