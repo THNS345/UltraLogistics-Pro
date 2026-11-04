@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import base64
 import html as _html
+import io
 import os
+from functools import lru_cache
 from typing import Optional
 
 import streamlit as st
@@ -35,6 +37,10 @@ INK = "#231f20"
 AMBER = "#e4a323"
 
 _LOGO_CANDIDATES = [
+    "EAS_Logo_UI.png",
+    "EAS_Logo_HighResolution.jpg",
+    "assets/EAS_Logo_UI.png",
+    "assets/EAS_Logo_HighResolution.jpg",
     "assets/eas_logo.png",
     "assets/logo.png",
     "eas_logo.png",
@@ -54,6 +60,7 @@ _CSS = r"""
 .stApp,.stApp p,.stApp label,.stApp li,.stApp input,.stApp textarea,.stApp button,
 .stApp h1,.stApp h2,.stApp h3,.stApp h4,.stApp table,.stApp [data-baseweb="select"],
 .stApp [data-baseweb="tab"],.stApp [data-testid="stMetricValue"]{font-family:var(--u-font) !important}
+.stApp [data-testid="stMarkdownContainer"],.stApp [data-testid="stMarkdownContainer"] div{font-family:var(--u-font) !important}
 .stApp [data-testid="stIconMaterial"],.stApp .material-icons{font-family:"Material Symbols Rounded","Material Icons" !important}
 
 header[data-testid="stHeader"]{background:transparent}
@@ -90,7 +97,8 @@ border-color:var(--u-amber);color:var(--u-ink);background:#fffaf0}
 .stButton>button:active,.stDownloadButton>button:active{transform:scale(.985)}
 .stButton>button[kind="primary"],[data-testid="stFormSubmitButton"]>button[kind="primary"],
 .stButton>button[data-testid="stBaseButton-primary"]{background:var(--u-amber);border-color:var(--u-amber);color:var(--u-ink);font-weight:600}
-.stButton>button[kind="primary"]:hover,.stButton>button[data-testid="stBaseButton-primary"]:hover{background:#d39512;border-color:#d39512;color:var(--u-ink)}
+[data-testid="stFormSubmitButton"]>button[kind="primaryFormSubmit"]{background:var(--u-amber);border-color:var(--u-amber);color:var(--u-ink);font-weight:600}
+.stButton>button[kind="primary"]:hover,.stButton>button[data-testid="stBaseButton-primary"]:hover,[data-testid="stFormSubmitButton"]>button[kind="primaryFormSubmit"]:hover{background:#d39512;border-color:#d39512;color:var(--u-ink)}
 .stButton>button:disabled{opacity:.45}
 .stButton>button:focus-visible,.stDownloadButton>button:focus-visible{outline:3px solid var(--u-amber-soft);outline-offset:1px}
 
@@ -137,14 +145,20 @@ box-shadow:0 1px 2px rgba(0,0,0,.04)}
 
 /* ---- brand header ---- */
 .u-head{display:flex;align-items:center;gap:14px;margin:.2rem 0 1rem}
-.u-head img{height:38px;width:auto;display:block}
+.u-head img{height:38px;width:auto;display:block;mix-blend-mode:multiply}
 .u-mark{width:38px;height:38px;border-radius:10px;background:var(--u-ink);color:var(--u-amber);display:grid;place-items:center;
 font-weight:700;font-size:1.05rem;letter-spacing:-.02em}
 .u-title{font-size:1.65rem;font-weight:700;letter-spacing:-.03em;line-height:1.1;color:var(--u-ink)}
 .u-sub{font-size:.86rem;color:var(--u-ink-2);margin-top:2px}
-.u-login{max-width:380px;margin:8vh auto 1rem;text-align:center}
-.u-login .u-head{justify-content:center;flex-direction:column;gap:10px}
-.u-login .u-title{font-size:1.5rem}
+.u-login{text-align:center;padding:2.5rem 0 1.5rem}
+.u-login img{height:96px;width:auto;max-width:100%;mix-blend-mode:multiply}
+.u-login .u-mark{width:72px;height:72px;border-radius:18px;font-size:1.5rem;margin:0 auto}
+.u-login-title{font-size:clamp(30px,5vw,44px);line-height:1.08;letter-spacing:-.025em;font-weight:700;margin:24px 0 0;color:var(--u-ink)}
+.u-login-lede{color:var(--u-ink-2);font-size:17px;margin:10px auto 0;max-width:60ch}
+.u-note{border-radius:14px;padding:12px 16px;font-size:14px;margin:10px 0;background:var(--u-amber-soft);color:var(--u-ink)}
+.u-note.good{background:rgba(52,199,89,.18)}
+.u-note.warn{background:rgba(255,159,10,.18)}
+.u-note.bad{background:rgba(255,59,48,.14)}
 
 @media (max-width:720px){
 .block-container{padding:.8rem .8rem 4rem}
@@ -158,22 +172,47 @@ button[data-baseweb="tab"]{padding:0 10px}
 
 
 def _find_logo() -> Optional[str]:
+    """First logo candidate that exists next to this file. File names are matched without regard to case."""
     here = os.path.dirname(os.path.abspath(__file__))
     for rel in _LOGO_CANDIDATES:
-        path = os.path.join(here, rel)
-        if os.path.isfile(path):
-            return path
+        folder, name = os.path.split(os.path.join(here, rel))
+        try:
+            for entry in os.listdir(folder):
+                if entry.lower() == name.lower() and os.path.isfile(os.path.join(folder, entry)):
+                    return os.path.join(folder, entry)
+        except OSError:
+            continue
     return None
+
+
+@lru_cache(maxsize=4)
+def _logo_data_uri(path: str, mtime: float) -> str:
+    """Logo as a small data: URI. A high-resolution file is shrunk to 2x the largest size shown (96 px)."""
+    mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    try:
+        from PIL import Image  # pillow ships with matplotlib
+
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+        if img.height > 192:
+            img = img.resize((max(1, round(img.width * 192 / img.height)), 192), Image.LANCZOS)
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA" if "transparency" in img.info or img.mode in ("LA", "P") else "RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        raw, mime = buf.getvalue(), "image/png"
+    except Exception:  # noqa: BLE001  fall back to the original bytes
+        pass
+    return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
 
 
 def _logo_html() -> str:
     path = _find_logo()
     if path:
         try:
-            with open(path, "rb") as fh:
-                data = base64.b64encode(fh.read()).decode("ascii")
-            mime = "image/png" if path.lower().endswith(".png") else "image/jpeg"
-            return f'<img alt="EAS" src="data:{mime};base64,{data}">'
+            return f'<img alt="EAS" src="{_logo_data_uri(path, os.path.getmtime(path))}">'
         except OSError:
             pass
     return '<div class="u-mark">EAS</div>'
@@ -192,13 +231,19 @@ def page_header(title: str, subtitle: str = "") -> None:
     )
 
 
-def login_header(title: str, subtitle: str = "") -> None:
-    sub = f'<div class="u-sub">{_html.escape(subtitle)}</div>' if subtitle else ""
+def login_header(title: str, lede: str = "Sign in with your EAS account.") -> None:
+    """Centered sign-in heading: large logo, app name and one line of guidance."""
+    lede_html = f'<p class="u-login-lede">{_html.escape(lede)}</p>' if lede else ""
     st.markdown(
-        f'<div class="u-login"><div class="u-head">{_logo_html()}'
-        f'<div><div class="u-title">{_html.escape(title)}</div>{sub}</div></div></div>',
+        f'<div class="u-login">{_logo_html()}<h1 class="u-login-title">{_html.escape(title)}</h1>{lede_html}</div>',
         unsafe_allow_html=True,
     )
+
+
+def note(kind: str, text: str) -> None:
+    """Soft tinted message bar. kind: good, warn, bad or anything else for amber."""
+    kind = kind if kind in ("good", "warn", "bad") else ""
+    st.markdown(f'<div class="u-note {kind}">{_html.escape(text)}</div>', unsafe_allow_html=True)
 
 
 def style_fig(fig, height: Optional[int] = None):

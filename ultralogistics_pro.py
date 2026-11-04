@@ -3415,44 +3415,62 @@ def vehicle_label(name: str) -> str:
 # 20. LOGIN / AUTHENTICATION
 # ==========================================================
 
-def check_password() -> bool:
+def load_users() -> Dict[str, str]:
     """
-    Username/password gate using Streamlit secrets:
+    Users come from Streamlit secrets, in either of these layouts. The first matches
+    the EAS Estimating Tool, so the same secrets block works in both apps.
+
+    [credentials.users]
+    thanos = "choose-a-password"
 
     [passwords]
-    admin = "your_password"
-    estimating = "another_password"
+    thanos = "choose-a-password"
     """
+    users: Dict[str, str] = {}
+    try:
+        users.update({str(k): str(v) for k, v in dict(st.secrets["credentials"]["users"]).items()})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for k, v in dict(st.secrets["passwords"]).items():
+            users.setdefault(str(k), str(v))
+    except Exception:  # noqa: BLE001
+        pass
+    return users
+
+
+def check_password() -> bool:
+    """Returns True once the user has signed in. Shows the sign-in screen otherwise."""
     if st.session_state.get("authenticated", False):
         return True
 
-    ui.login_header(APP_NAME, "Sign in to continue")
+    users = load_users()
 
-    try:
-        valid_passwords = dict(st.secrets.get("passwords", {}))
-    except Exception:  # noqa: BLE001
-        valid_passwords = {}
-
-    if not valid_passwords:
-        st.error("No passwords are configured. Add a [passwords] section in Streamlit secrets.")
-        st.stop()
-
-    with st.form("login_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-        submitted = st.form_submit_button("Login")
-
-    if submitted:
-        username = clean_str(username)
-        if username in valid_passwords and hmac.compare_digest(
-            password.encode("utf-8"), str(valid_passwords[username]).encode("utf-8")
-        ):
+    def password_entered() -> None:
+        name = clean_str(st.session_state.get("login_user", ""))
+        password = str(st.session_state.get("login_pass", ""))
+        stored = users.get(name)
+        if stored is not None and hmac.compare_digest(password.encode("utf-8"), stored.encode("utf-8")):
             st.session_state.authenticated = True
-            st.session_state.username = username
-            st.rerun()
+            st.session_state.login_failed = False
+            st.session_state.username = name
+            st.session_state.pop("login_pass", None)
+            st.session_state.pop("login_user", None)
         else:
-            st.error("Invalid username or password.")
+            st.session_state.login_failed = True
 
+    _, middle, _ = st.columns([1, 1.6, 1])
+    with middle:
+        ui.login_header(APP_NAME)
+        if not users:
+            st.error("Authentication secrets not configured correctly. Add a [credentials.users] section in Streamlit secrets.")
+            st.stop()
+        with st.form("login_form"):
+            st.text_input("Username", key="login_user")
+            st.text_input("Password", type="password", key="login_pass")
+            st.form_submit_button("Sign in", type="primary", on_click=password_entered, **ui.STRETCH)
+        if st.session_state.get("login_failed"):
+            ui.note("bad", "Invalid username or password.")
     st.stop()
     return False
 
