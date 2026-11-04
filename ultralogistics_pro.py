@@ -50,7 +50,7 @@ import ui_theme as ui  # Apple-style look (same theme as the EAS Estimating Tool
 # Run with:  streamlit run ultralogistics_pro.py
 # ==========================================================
 
-APP_NAME = "EAS Lofistics"
+APP_NAME = "EAS Logistics"
 APP_VERSION = "2026-11-03 guided"
 
 
