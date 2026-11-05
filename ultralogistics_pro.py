@@ -3518,14 +3518,14 @@ def render_home() -> None:
     jobs = list_jobs()
 
     if folder is None:
-        st.info("Jobs cannot be saved on this server. Download the job file from the Plan step to keep a job.")
+        st.info("Jobs cannot be saved on this server. Use Download job file inside a job to keep a copy.")
     elif not jobs:
         st.info("No jobs yet. Start a new job, add the units, and it is saved here automatically.")
 
     for job in jobs:
         status = job["status"]
         with st.container(border=True):
-            cols = st.columns([5, 3, 1.2, 1.2], vertical_alignment="center")
+            cols = st.columns([5, 3, 1.2, 1.2, 1.6], vertical_alignment="center")
             meta = " | ".join(x for x in [job["reference"], status.get("units") and f"{status['units']} units", job["saved_at"]] if x)
             cols[0].markdown(
                 f"**{_html.escape(job['name'])}**  \n<span style='color:#6e6e73;font-size:.86rem'>{_html.escape(meta)}</span>",
@@ -3537,6 +3537,12 @@ def render_home() -> None:
                 "Delete", key=f"del_{job['id']}",
                 on_click=lambda jid=job["id"]: st.session_state.update(confirm_delete=jid), **ui.STRETCH,
             )
+            try:
+                with open(os.path.join(folder, f"{job['id']}.json"), "rb") as fh:
+                    cols[4].download_button("Download", data=fh.read(), file_name=f"{job['id']}.json",
+                                            mime="application/json", key=f"dl_{job['id']}", **ui.STRETCH)
+            except OSError:
+                pass
             if st.session_state.confirm_delete == job["id"]:
                 st.warning(f"Delete {job['name']}? This cannot be undone.")
                 confirm = st.columns([1, 1, 4])
@@ -3894,11 +3900,30 @@ def render_upload_editor(name: str) -> None:
         st.caption(f"Choose the column for: {', '.join(missing)}.")
 
 
-def render_order_preview(name: str) -> None:
-    if not has_master():
-        return
+def apply_unit_table(name: str, edited: pd.DataFrame) -> None:
+    """Rebuild one order from the edited grid by feeding it through the paste parser."""
+    lines: List[str] = []
+    for _, r in edited.iterrows():
+        cells = ["" if is_blank(r.get(c)) else clean_str(r.get(c)).replace(",", " ")
+                 for c in ("Mark", "Width (in)", "Height (in)", "Type", "Qty")]
+        if not any(cells):
+            continue
+        lines.append(", ".join(cells))
+    text = "\n".join(lines)
+    st.session_state.orders[name] = text
+    st.session_state[f"paste_{st.session_state.job_id}_{name}"] = text
+    rows, issues = parse_order_text_to_rows(name, text, st.session_state.assumptions)
+    replace_order_rows(name, rows)
+    st.session_state.order_issues[name] = validation_issues_to_df(issues)
+    st.session_state.grid_ver = st.session_state.get("grid_ver", 0) + 1
 
-    sub = st.session_state.df_master[st.session_state.df_master["Order"].astype(str) == name]
+
+def render_order_preview(name: str) -> None:
+    job = st.session_state.job_id
+    sub = (
+        st.session_state.df_master[st.session_state.df_master["Order"].astype(str) == name]
+        if has_master() else pd.DataFrame(columns=MASTER_COLUMNS)
+    )
     issues = st.session_state.order_issues.get(name)
 
     if sub.empty:
@@ -3919,12 +3944,36 @@ def render_order_preview(name: str) -> None:
 
     table = sub.groupby("Orig", sort=False).agg(
         Mark=("Mark", "first"), Width=("W", "first"), Height=("H", "first"),
-        Type=("Type", "first"), Qty=("ID", "count"), Weight=("Lbs", "first"),
+        Type=("Type", "first"), Qty=("ID", "count"),
     ).reset_index(drop=True)
-    table = table.rename(columns={"Width": "Width (in)", "Height": "Height (in)", "Weight": "Weight each (lbs)"})
-    st.dataframe(table.round(1).head(60), hide_index=True, **ui.STRETCH)
-    if len(table) > 60:
-        st.caption(f"{len(table) - 60} more rows not shown.")
+    table = table.rename(columns={"Width": "Width (in)", "Height": "Height (in)"})
+
+    st.markdown("**Edit units**")
+    st.caption(
+        "Change any cell, add rows at the bottom, select rows and press Delete to remove them, "
+        "or paste a block of cells from Excel. Press Apply when you are done."
+    )
+    edited = st.data_editor(
+        table,
+        key=f"grid_{job}_{name}_{st.session_state.get('grid_ver', 0)}",
+        hide_index=True,
+        num_rows="dynamic",
+        column_config={
+            "Mark": st.column_config.TextColumn("Mark", required=True),
+            "Width (in)": st.column_config.NumberColumn("Width (in)", min_value=0.01, step=0.125, format="%.3f"),
+            "Height (in)": st.column_config.NumberColumn("Height (in)", min_value=0.01, step=0.125, format="%.3f"),
+            "Type": st.column_config.TextColumn("Type"),
+            "Qty": st.column_config.NumberColumn("Qty", min_value=1, step=1, default=1),
+        },
+        **ui.STRETCH,
+    )
+    st.button(
+        "Apply changes", key=f"apply_grid_{job}_{name}", on_click=apply_unit_table, args=(name, edited),
+    )
+    st.caption(
+        "Applying rebuilds this order's units, so weights are recalculated and any shipping choices "
+        "or row edits made later in Check are reset for this order."
+    )
 
 
 def render_step_units() -> None:
@@ -4381,6 +4430,22 @@ def render_step_plan() -> None:
 # 26. MAIN
 # ==========================================================
 
+def render_job_download() -> None:
+    """Download the open job as a JSON file, usable from any step."""
+    payload = build_job_save_payload(
+        st.session_state.project, st.session_state.assumptions, st.session_state.orders,
+        st.session_state.df_master, st.session_state.selected_vehicle, st.session_state.selected_pallets,
+        extra={"job_id": st.session_state.job_id, "step": st.session_state.step,
+               "decided": st.session_state.decided, "status": compute_status()},
+    )
+    name = slugify(st.session_state.project.project_name or st.session_state.job_id, "job")
+    st.download_button(
+        "Download job file", data=json_download_bytes(payload), file_name=f"{name}.json",
+        mime="application/json", key="job_file_dl",
+        help="Keeps a backup you can re-open later from the Jobs screen.",
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_NAME, page_icon="📦", layout="wide", initial_sidebar_state="collapsed")
     ui.apply_theme()
@@ -4408,6 +4473,7 @@ def main() -> None:
             render_step_plan()
 
         save_current_job()
+        render_job_download()
 
     st.divider()
     st.caption(
